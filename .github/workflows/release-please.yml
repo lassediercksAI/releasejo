@@ -1,0 +1,24 @@
+# Versioning + releases for releasejo, on its GitHub home.
+#
+# Yes — we use Google's release-please to release the Forgejo-native
+# reimplementation of release-please. It's the honest bootstrap: releasejo lives
+# on GitHub, so GitHub Actions + release-please is the natural tooling until
+# releasejo is proven enough to release itself on a Forgejo mirror
+# (see .forgejo/workflows/release.yml). Same config file drives both.
+name: release-please
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
