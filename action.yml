@@ -1,0 +1,42 @@
+# Forgejo/Gitea Action wrapper for releasejo. Docker-based so it runs identically
+# on any runner without a Go toolchain in the job.
+#
+#   jobs:
+#     release:
+#       runs-on: self-hosted
+#       steps:
+#         - uses: actions/checkout@v4
+#         - uses: exaptation/releasejo@v0
+#           with:
+#             token: ${{ secrets.RELEASE_TOKEN }}   # bot PAT: contents + PR write
+name: releasejo
+description: release-please-compatible release automation for Forgejo & Gitea.
+inputs:
+  token:
+    description: "Bot PAT with contents:write + pull-requests:write. NOT the auto job token (it can't open PRs / trigger downstream)."
+    required: true
+  config-file:
+    description: Path to release-please-config.json.
+    required: false
+    default: release-please-config.json
+  manifest-file:
+    description: Path to .release-please-manifest.json.
+    required: false
+    default: .release-please-manifest.json
+  target-branch:
+    description: Release target branch. Defaults to the ref the workflow runs on.
+    required: false
+    default: ""
+  dry-run:
+    description: Compute and log, but make no changes.
+    required: false
+    default: "false"
+runs:
+  using: docker
+  image: Dockerfile
+  env:
+    INPUT_TOKEN: ${{ inputs.token }}
+    INPUT_CONFIG_FILE: ${{ inputs.config-file }}
+    INPUT_MANIFEST_FILE: ${{ inputs.manifest-file }}
+    INPUT_TARGET_BRANCH: ${{ inputs.target-branch }}
+    INPUT_DRY_RUN: ${{ inputs.dry-run }}

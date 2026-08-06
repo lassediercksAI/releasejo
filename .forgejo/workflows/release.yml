@@ -1,0 +1,16 @@
+# releasejo releases itself (dogfood). The first tag must be cut by hand (the
+# Docker action needs an image; until then, run the binary locally). After that
+# this keeps a release PR open and tags on merge.
+name: release
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}

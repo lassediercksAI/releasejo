@@ -1,0 +1,9 @@
+{
+  "release-type": "go",
+  "packages": {
+    ".": {
+      "component": "releasejo",
+      "extra-files": ["internal/version/version.go"]
+    }
+  }
+}

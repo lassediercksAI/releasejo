@@ -1,0 +1,464 @@
+// Package release is the orchestrator: it turns conventional commits into a
+// release pull request, and — when that PR is merged — into tags + releases.
+// It is the releasejo equivalent of release-please's "manifest" run, targeting
+// Forgejo/Gitea instead of GitHub.
+package release
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/lassediercksAI/releasejo/internal/changelog"
+	"github.com/lassediercksAI/releasejo/internal/config"
+	"github.com/lassediercksAI/releasejo/internal/conventional"
+	"github.com/lassediercksAI/releasejo/internal/forge"
+	"github.com/lassediercksAI/releasejo/internal/semver"
+	"github.com/lassediercksAI/releasejo/internal/updater"
+)
+
+const (
+	pendingLabel = "autorelease: pending"
+	taggedLabel  = "autorelease: tagged"
+	labelColor   = "ededed"
+	prBodyMarker = "<!-- releasejo -->"
+)
+
+// API is the slice of the forge client the orchestrator uses. Defining it here
+// (consumer-side) keeps *forge.Client as the production impl while letting tests
+// drive Run with an in-memory fake.
+type API interface {
+	TagCommit(ctx context.Context, tag string) (string, error)
+	Commits(ctx context.Context, sha, path string, max int) ([]forge.Commit, error)
+	BranchExists(ctx context.Context, name string) (bool, error)
+	CreateBranch(ctx context.Context, name, from string) error
+	GetFile(ctx context.Context, path, ref string) (*forge.File, error)
+	PutFile(ctx context.Context, path, branch, content, prevSHA, message string) error
+	Pulls(ctx context.Context, state string) ([]forge.Pull, error)
+	CreatePull(ctx context.Context, head, base, title, body string) (*forge.Pull, error)
+	EditPull(ctx context.Context, number int, title, body string) error
+	EnsureLabel(ctx context.Context, name, color string) (int64, error)
+	SetIssueLabels(ctx context.Context, number int, ids []int64) error
+	CreateRelease(ctx context.Context, tag, target, name, body string, prerelease bool) error
+}
+
+// Options tune a run. Zero values are sensible defaults except TargetBranch.
+type Options struct {
+	TargetBranch string
+	MaxCommits   int
+	DryRun       bool
+	Now          func() time.Time
+	Logf         func(string, ...any)
+}
+
+func (o *Options) defaults() {
+	if o.MaxCommits == 0 {
+		o.MaxCommits = 500
+	}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	if o.Logf == nil {
+		o.Logf = func(string, ...any) {}
+	}
+}
+
+// pkgPlan is a pending release for one package.
+type pkgPlan struct {
+	pkg     config.Package
+	last    semver.Version
+	next    semver.Version
+	tag     string
+	entry   string // rendered changelog entry
+	commits int
+}
+
+// Run executes one full cycle: first tag any just-merged release PR, then
+// (re)build the pending release PR from new commits.
+func Run(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) error {
+	opts.defaults()
+
+	if err := tagMerged(ctx, cl, cfg, man, opts); err != nil {
+		return fmt.Errorf("tagging merged release: %w", err)
+	}
+
+	plans, err := computePlans(ctx, cl, cfg, man, opts)
+	if err != nil {
+		return err
+	}
+	if len(plans) == 0 {
+		opts.Logf("no releasable changes since the last release")
+		return nil
+	}
+	return upsertReleasePR(ctx, cl, cfg, man, plans, opts)
+}
+
+// TagFor builds the git tag for a package version, honouring include-v-in-tag
+// and include-component-in-tag (e.g. "v1.2.3" or "build-harbor-image-v0.1.0").
+func TagFor(cfg *config.Config, p config.Package, v semver.Version) string {
+	ver := v.String()
+	if p.IncludeV() {
+		ver = "v" + ver
+	}
+	if cfg.IncludeComponent(p) && p.Component != "" {
+		return p.Component + p.TagSeparator + ver
+	}
+	return ver
+}
+
+// computePlans figures out, per package, the next version + changelog from the
+// commits since that package's last release tag.
+func computePlans(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) ([]pkgPlan, error) {
+	var plans []pkgPlan
+	date := opts.Now().UTC().Format("2006-01-02")
+
+	for _, p := range cfg.Packages {
+		last, err := semver.Parse(orZero(man[p.Path]))
+		if err != nil {
+			return nil, fmt.Errorf("package %q: manifest version: %w", p.Path, err)
+		}
+		boundary, err := cl.TagCommit(ctx, TagFor(cfg, p, last))
+		if err != nil {
+			return nil, fmt.Errorf("package %q: resolving last tag: %w", p.Path, err)
+		}
+
+		raw, err := cl.Commits(ctx, opts.TargetBranch, p.Path, opts.MaxCommits)
+		if err != nil {
+			return nil, fmt.Errorf("package %q: listing commits: %w", p.Path, err)
+		}
+
+		var ccs []conventional.Commit
+		level := semver.None
+		for _, rc := range raw {
+			if boundary != "" && rc.SHA == boundary {
+				break // reached the last release
+			}
+			cc := conventional.Parse(rc.Message, rc.SHA)
+			if isReleaseCommit(cc) {
+				continue
+			}
+			ccs = append(ccs, cc)
+			level = semver.Max(level, cc.Level())
+		}
+		if level == semver.None {
+			opts.Logf("%s: nothing to release", label(p))
+			continue
+		}
+
+		next := last.Bump(level, p.BumpMinorPreMajor)
+		compareURL := "" // reserved: a Forgejo compare link once we track the base sha
+		entry := changelog.Render(next.String(), date, ccs, sections(p), compareURL)
+		plans = append(plans, pkgPlan{
+			pkg:     p,
+			last:    last,
+			next:    next,
+			tag:     TagFor(cfg, p, next),
+			entry:   entry,
+			commits: len(ccs),
+		})
+		opts.Logf("%s: %s -> %s (%s, %d commits)", label(p), last, next, level, len(ccs))
+	}
+	return plans, nil
+}
+
+// upsertReleasePR builds the release branch from base + this run's changes and
+// opens or refreshes a single release PR (separate-pull-requests is a documented
+// v0.1 limitation — everything lands in one PR).
+func upsertReleasePR(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, plans []pkgPlan, opts Options) error {
+	branch := "releasejo--branches--" + opts.TargetBranch
+	title := releaseTitle(plans)
+	body := releaseBody(plans)
+
+	if opts.DryRun {
+		opts.Logf("[dry-run] would open/update PR %q on branch %s:\n%s", title, branch, body)
+		return nil
+	}
+
+	exists, err := cl.BranchExists(ctx, branch)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if err := cl.CreateBranch(ctx, branch, opts.TargetBranch); err != nil {
+			return fmt.Errorf("creating release branch: %w", err)
+		}
+	}
+
+	// All file writes derive from BASE content, so re-running never stacks
+	// duplicate changelog entries onto the branch (idempotent).
+	newMan := cloneManifest(man)
+	for _, pl := range plans {
+		// changelog
+		if err := patchFile(ctx, cl, pl.pkg.ChangelogPath, opts.TargetBranch, branch, title, func(base string) string {
+			return changelog.Prepend(base, pl.entry)
+		}); err != nil {
+			return fmt.Errorf("%s: changelog: %w", label(pl.pkg), err)
+		}
+		// version-bearing files: release-type default file + extra-files
+		for _, f := range versionFiles(pl.pkg) {
+			f := f
+			if err := patchFile(ctx, cl, f, opts.TargetBranch, branch, title, func(base string) string {
+				return updater.Apply(pl.pkg.ReleaseType, f, base, pl.next.String())
+			}); err != nil {
+				return fmt.Errorf("%s: updating %s: %w", label(pl.pkg), f, err)
+			}
+		}
+		newMan[pl.pkg.Path] = pl.next.String()
+	}
+	// manifest
+	manBytes, err := newMan.Marshal()
+	if err != nil {
+		return err
+	}
+	if err := putFrom(ctx, cl, ".release-please-manifest.json", branch, string(manBytes), title); err != nil {
+		return fmt.Errorf("updating manifest: %w", err)
+	}
+
+	// open or refresh the PR
+	open, err := findOpenReleasePR(ctx, cl, branch)
+	if err != nil {
+		return err
+	}
+	if open != nil {
+		opts.Logf("refreshing release PR #%d", open.Number)
+		return cl.EditPull(ctx, open.Number, title, body)
+	}
+	pr, err := cl.CreatePull(ctx, branch, opts.TargetBranch, title, body)
+	if err != nil {
+		return fmt.Errorf("creating release PR: %w", err)
+	}
+	opts.Logf("opened release PR #%d", pr.Number)
+	id, err := cl.EnsureLabel(ctx, pendingLabel, labelColor)
+	if err != nil {
+		return err
+	}
+	return cl.SetIssueLabels(ctx, pr.Number, []int64{id})
+}
+
+// tagMerged looks for a just-merged release PR and cuts the tags/releases its
+// merge introduced (versions now present in main's manifest but not yet tagged).
+func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) error {
+	closed, err := cl.Pulls(ctx, "closed")
+	if err != nil {
+		return err
+	}
+	for _, pr := range closed {
+		if !pr.Merged || !hasLabel(pr, pendingLabel) || hasLabel(pr, taggedLabel) {
+			continue
+		}
+		opts.Logf("release PR #%d merged (%s); cutting releases", pr.Number, short(pr.MergeCommitSHA))
+		for _, p := range cfg.Packages {
+			v, err := semver.Parse(orZero(man[p.Path]))
+			if err != nil {
+				return err
+			}
+			tag := TagFor(cfg, p, v)
+			existing, err := cl.TagCommit(ctx, tag)
+			if err != nil {
+				return err
+			}
+			if existing != "" {
+				continue // already released
+			}
+			notes := extractEntry(changelogOnMain(ctx, cl, p, opts), v.String())
+			if opts.DryRun {
+				opts.Logf("[dry-run] would create release %s", tag)
+				continue
+			}
+			if err := cl.CreateRelease(ctx, tag, opts.TargetBranch, tag, notes, v.IsPrerelease()); err != nil {
+				return fmt.Errorf("creating release %s: %w", tag, err)
+			}
+			opts.Logf("created release %s", tag)
+		}
+		if !opts.DryRun {
+			id, err := cl.EnsureLabel(ctx, taggedLabel, labelColor)
+			if err != nil {
+				return err
+			}
+			// keep pending removed by replacing labels with just "tagged"
+			if err := cl.SetIssueLabels(ctx, pr.Number, []int64{id}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ---- helpers --------------------------------------------------------------
+
+// patchFile reads the file from base, transforms it, and writes it to branch
+// (creating or overwriting). A missing base file transforms an empty string.
+func patchFile(ctx context.Context, cl API, path, base, branch, msg string, transform func(string) string) error {
+	baseContent := ""
+	if f, err := cl.GetFile(ctx, path, base); err == nil {
+		baseContent = f.Content
+	} else if !forge.NotFound(err) {
+		return err
+	}
+	return putFrom(ctx, cl, path, branch, transform(baseContent), msg)
+}
+
+// putFrom writes content to path on branch, supplying the branch file's current
+// SHA when it already exists (required by the API to overwrite).
+func putFrom(ctx context.Context, cl API, path, branch, content, msg string) error {
+	prev := ""
+	if f, err := cl.GetFile(ctx, path, branch); err == nil {
+		prev = f.SHA
+	} else if !forge.NotFound(err) {
+		return err
+	}
+	return cl.PutFile(ctx, path, branch, content, prev, "chore(release): "+msg)
+}
+
+func findOpenReleasePR(ctx context.Context, cl API, branch string) (*forge.Pull, error) {
+	open, err := cl.Pulls(ctx, "open")
+	if err != nil {
+		return nil, err
+	}
+	for i := range open {
+		if open[i].Head.Ref == branch {
+			return &open[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func changelogOnMain(ctx context.Context, cl API, p config.Package, opts Options) string {
+	f, err := cl.GetFile(ctx, p.ChangelogPath, opts.TargetBranch)
+	if err != nil {
+		return ""
+	}
+	return f.Content
+}
+
+// extractEntry pulls the section for a specific version out of a CHANGELOG,
+// used as release notes. Matches "## [ver]" or "## ver".
+func extractEntry(changelogText, version string) string {
+	lines := strings.Split(changelogText, "\n")
+	start := -1
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "## ") && strings.Contains(ln, version) {
+			start = i
+			break
+		}
+	}
+	if start == -1 {
+		return ""
+	}
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "## ") {
+			end = i
+			break
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines[start+1:end], "\n"))
+}
+
+func isReleaseCommit(c conventional.Commit) bool {
+	return c.Type == "chore" && strings.Contains(strings.ToLower(c.Description), "release")
+}
+
+func sections(p config.Package) []changelog.Section {
+	if len(p.ChangelogSections) == 0 {
+		return changelog.DefaultSections()
+	}
+	out := make([]changelog.Section, len(p.ChangelogSections))
+	for i, s := range p.ChangelogSections {
+		out[i] = changelog.Section{Type: s.Type, Section: s.Section, Hidden: s.Hidden}
+	}
+	return out
+}
+
+// versionFiles is the set of files whose version should be bumped: the
+// release-type's conventional file (if any) plus configured extra-files.
+func versionFiles(p config.Package) []string {
+	var files []string
+	switch p.ReleaseType {
+	case "simple":
+		files = append(files, join(p.Path, "version.txt"))
+	case "node":
+		files = append(files, join(p.Path, "package.json"))
+	}
+	for _, f := range p.ExtraFiles {
+		files = append(files, join(p.Path, f))
+	}
+	return files
+}
+
+func releaseTitle(plans []pkgPlan) string {
+	if len(plans) == 1 {
+		return "chore(release): " + plans[0].next.String()
+	}
+	var parts []string
+	for _, p := range plans {
+		parts = append(parts, fmt.Sprintf("%s %s", compName(p.pkg), p.next))
+	}
+	return "chore(release): " + strings.Join(parts, ", ")
+}
+
+func releaseBody(plans []pkgPlan) string {
+	var b strings.Builder
+	b.WriteString(prBodyMarker + "\n\n")
+	b.WriteString("Automated release prepared by releasejo. Merge to tag and publish.\n\n")
+	for _, p := range plans {
+		fmt.Fprintf(&b, "## %s: %s\n\n%s\n\n", compName(p.pkg), p.next, p.entry)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func label(p config.Package) string {
+	if c := compName(p); c != "" {
+		return c
+	}
+	return p.Path
+}
+func compName(p config.Package) string {
+	if p.Component != "" {
+		return p.Component
+	}
+	if p.PackageName != "" {
+		return p.PackageName
+	}
+	if p.Path == "." || p.Path == "" {
+		return "root"
+	}
+	return p.Path
+}
+
+func hasLabel(p forge.Pull, name string) bool {
+	for _, l := range p.Labels {
+		if l.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneManifest(m config.Manifest) config.Manifest {
+	out := make(config.Manifest, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func orZero(v string) string {
+	if v == "" {
+		return "0.0.0"
+	}
+	return v
+}
+func short(s string) string {
+	if len(s) > 7 {
+		return s[:7]
+	}
+	return s
+}
+func join(base, f string) string {
+	if base == "" || base == "." {
+		return f
+	}
+	return strings.TrimRight(base, "/") + "/" + f
+}

@@ -1,0 +1,16 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: self-hosted
+    container:
+      image: docker.io/library/golang:1.26
+    steps:
+      - uses: actions/checkout@v4
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build ./...
