@@ -150,6 +150,44 @@ func TestRunNothingToRelease(t *testing.T) {
 	}
 }
 
+func TestSeparatePullRequests(t *testing.T) {
+	f := newFake()
+	f.commits["services/api"] = []forge.Commit{{SHA: "a1", Message: "feat: api thing"}}
+	f.commits["services/web"] = []forge.Commit{{SHA: "w1", Message: "fix: web thing"}}
+	cfg, err := config.ParseConfig([]byte(`{
+      "release-type": "node",
+      "separate-pull-requests": true,
+      "packages": {
+        "services/api": { "component": "api" },
+        "services/web": { "component": "web" }
+      }
+    }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	man := config.Manifest{"services/api": "1.0.0", "services/web": "2.0.0"}
+
+	if err := Run(context.Background(), f, cfg, man, Options{TargetBranch: "main", Now: fixedClock()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.created) != 2 {
+		t.Fatalf("expected 2 separate PRs, got %d", len(f.created))
+	}
+	// distinct component branches
+	branches := map[string]bool{}
+	for _, pr := range f.created {
+		branches[pr.Head.Ref] = true
+	}
+	if !branches["releasejo--branches--main--components--api"] || !branches["releasejo--branches--main--components--web"] {
+		t.Errorf("component branches wrong: %v", branches)
+	}
+	// api PR bumped only api's manifest entry (feat on 1.0.0 -> 1.1.0), from base
+	apiMan := f.puts["releasejo--branches--main--components--api\x00.release-please-manifest.json"]
+	if !strings.Contains(apiMan, `"1.1.0"`) || !strings.Contains(apiMan, `"2.0.0"`) {
+		t.Errorf("api PR manifest should have api=1.1.0 and untouched web=2.0.0:\n%s", apiMan)
+	}
+}
+
 func TestTagOnMerge(t *testing.T) {
 	f := newFake()
 	// a merged release PR carrying the pending label, no new commits to release

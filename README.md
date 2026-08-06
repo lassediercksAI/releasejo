@@ -96,12 +96,11 @@ re-running never stacks duplicate changelog entries.
 Implemented and tested: conventional-commit parsing, semver bump (incl.
 pre-1.0 semantics), release-please config + manifest parsing, changelog
 generation, version updaters (`go`, `simple`, `node`, generic
-`x-release-please-version` markers), the release-PR + tag-on-merge orchestration
-against the Forgejo/Gitea REST API.
+`x-release-please-version` markers), monorepo **`separate-pull-requests`**, and
+the release-PR + tag-on-merge orchestration against the Forgejo/Gitea REST API.
 
 Not yet (contributions welcome):
 
-- `separate-pull-requests` — v0.x lands all packages in **one** release PR.
 - The full release-please release-type catalogue (only the common ones above).
 - Linked-versions, plugins, and `bootstrap-sha`.
 

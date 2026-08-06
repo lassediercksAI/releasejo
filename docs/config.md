@@ -12,7 +12,7 @@ Top-level keys act as **defaults** for every package; per-package keys override.
 |-----|-------|---------|-------|
 | `release-type` | global + package | — (required) | `go`, `simple`, `node`, or any type (falls back to marker-only updates). |
 | `bump-minor-pre-major` | global + package | `false` | Pre-1.0: a breaking change bumps the minor and feat/fix bump the patch. |
-| `separate-pull-requests` | global | `false` | **v0.x: not yet honoured** — always one PR. |
+| `separate-pull-requests` | global | `false` | When true, one release PR **per package** on `releasejo--branches--<base>--components--<component>` branches (rebuilt from base, so sequential merges reconcile the shared manifest). |
 | `include-component-in-tag` | global + package | `true` if >1 package | `<component><sep>v<version>` vs `v<version>`. |
 | `include-v-in-tag` | global + package | `true` | Leading `v` in the tag. |
 | `tag-separator` | global + package | `-` | Between component and version. |

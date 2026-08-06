@@ -91,7 +91,7 @@ func Run(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, o
 		opts.Logf("no releasable changes since the last release")
 		return nil
 	}
-	return upsertReleasePR(ctx, cl, cfg, man, plans, opts)
+	return upsertReleasePRs(ctx, cl, cfg, man, plans, opts)
 }
 
 // TagFor builds the git tag for a package version, honouring include-v-in-tag
@@ -162,11 +162,27 @@ func computePlans(ctx context.Context, cl API, cfg *config.Config, man config.Ma
 	return plans, nil
 }
 
-// upsertReleasePR builds the release branch from base + this run's changes and
-// opens or refreshes a single release PR (separate-pull-requests is a documented
-// v0.1 limitation — everything lands in one PR).
-func upsertReleasePR(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, plans []pkgPlan, opts Options) error {
-	branch := "releasejo--branches--" + opts.TargetBranch
+// upsertReleasePRs opens/refreshes the release PR(s): one aggregate PR by
+// default, or one PR per package when separate-pull-requests is set. Every branch
+// is rebuilt from base, so after one component PR merges the others are re-derived
+// from the new base on the next run — sequential merges reconcile the shared
+// manifest cleanly.
+func upsertReleasePRs(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, plans []pkgPlan, opts Options) error {
+	if cfg.SeparatePullRequests {
+		for _, pl := range plans {
+			branch := "releasejo--branches--" + opts.TargetBranch + "--components--" + componentSlug(pl.pkg)
+			if err := buildAndUpsertPR(ctx, cl, man, []pkgPlan{pl}, branch, opts); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return buildAndUpsertPR(ctx, cl, man, plans, "releasejo--branches--"+opts.TargetBranch, opts)
+}
+
+// buildAndUpsertPR rebuilds `branch` from base with the given plans' changes and
+// opens or refreshes its PR.
+func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []pkgPlan, branch string, opts Options) error {
 	title := releaseTitle(plans)
 	body := releaseBody(plans)
 
@@ -425,6 +441,20 @@ func compName(p config.Package) string {
 		return "root"
 	}
 	return p.Path
+}
+
+// componentSlug makes a branch-safe slug from a package's component/path.
+func componentSlug(p config.Package) string {
+	var b strings.Builder
+	for _, r := range compName(p) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
 }
 
 func hasLabel(p forge.Pull, name string) bool {
