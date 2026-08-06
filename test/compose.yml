@@ -1,0 +1,12 @@
+# Throwaway Forgejo for validating releasejo end-to-end (docs/validating-live.md).
+# `docker compose -f test/compose.yml up -d`, then follow the doc.
+services:
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:14
+    environment:
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__actions__ENABLED: "true"
+      FORGEJO__server__ROOT_URL: "http://localhost:3000/"
+    ports:
+      - "3000:3000"
+    # Ephemeral: no volume, so `down` wipes it for a clean re-run.

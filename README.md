@@ -104,9 +104,10 @@ Not yet (contributions welcome):
 - The full release-please release-type catalogue (only the common ones above).
 - Linked-versions, plugins, and `bootstrap-sha`.
 
-The pure-logic core has unit tests; the forge integration is exercised via an
-in-memory fake and should be validated against a live instance before you rely
-on it (see the project's rollout notes).
+The pure-logic core has unit tests; the forge REST client is tested against a
+stubbed Gitea API (httptest) and the orchestrator via an in-memory fake. Before
+relying on it, run the ~10-minute end-to-end check against a throwaway Forgejo:
+[`docs/validating-live.md`](docs/validating-live.md).
 
 ## License
 
