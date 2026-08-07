@@ -21,6 +21,10 @@ type Package struct {
 
 	BumpMinorPreMajor bool `json:"bump-minor-pre-major,omitempty"`
 
+	// versioning strategy: "" / "default" (semantic), "always-bump-patch",
+	// or "always-bump-minor".
+	Versioning string `json:"versioning,omitempty"`
+
 	// tag shape
 	IncludeComponentInTag *bool  `json:"include-component-in-tag,omitempty"`
 	IncludeVInTag         *bool  `json:"include-v-in-tag,omitempty"`
@@ -48,6 +52,7 @@ type Config struct {
 // overrides. Pointers distinguish "unset" from "false".
 type rawConfig struct {
 	ReleaseType           string                `json:"release-type"`
+	Versioning            string                `json:"versioning"`
 	BumpMinorPreMajor     *bool                 `json:"bump-minor-pre-major"`
 	SeparatePullRequests  *bool                 `json:"separate-pull-requests"`
 	IncludeComponentInTag *bool                 `json:"include-component-in-tag"`
@@ -59,6 +64,7 @@ type rawConfig struct {
 
 type rawPackage struct {
 	ReleaseType           *string            `json:"release-type"`
+	Versioning            *string            `json:"versioning"`
 	Component             string             `json:"component"`
 	PackageName           string             `json:"package-name"`
 	ChangelogPath         string             `json:"changelog-path"`
@@ -95,6 +101,7 @@ func ParseConfig(b []byte) (*Config, error) {
 		p := Package{
 			Path:                  path,
 			ReleaseType:           strPtrOr(rp.ReleaseType, raw.ReleaseType),
+			Versioning:            strPtrOr(rp.Versioning, raw.Versioning),
 			Component:             rp.Component,
 			PackageName:           rp.PackageName,
 			ChangelogPath:         strOr(rp.ChangelogPath, "CHANGELOG.md"),

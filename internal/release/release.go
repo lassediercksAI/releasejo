@@ -146,7 +146,7 @@ func computePlans(ctx context.Context, cl API, cfg *config.Config, man config.Ma
 			continue
 		}
 
-		next := last.Bump(level, p.BumpMinorPreMajor)
+		next := bumpFor(p, last, level)
 		compareURL := "" // reserved: a Forgejo compare link once we track the base sha
 		entry := changelog.Render(next.String(), date, ccs, sections(p), compareURL)
 		plans = append(plans, pkgPlan{
@@ -441,6 +441,21 @@ func compName(p config.Package) string {
 		return "root"
 	}
 	return p.Path
+}
+
+// bumpFor applies the package's versioning strategy. `always-bump-patch` /
+// `always-bump-minor` force that bump size for any releasable change (release-please
+// semantics); anything else is the default semantic bump (level-driven, honouring
+// bump-minor-pre-major).
+func bumpFor(p config.Package, v semver.Version, level semver.Level) semver.Version {
+	switch p.Versioning {
+	case "always-bump-patch":
+		return v.Bump(semver.Patch, false)
+	case "always-bump-minor":
+		return v.Bump(semver.Minor, false)
+	default:
+		return v.Bump(level, p.BumpMinorPreMajor)
+	}
 }
 
 // componentSlug makes a branch-safe slug from a package's component/path.

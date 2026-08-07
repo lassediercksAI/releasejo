@@ -150,6 +150,31 @@ func TestRunNothingToRelease(t *testing.T) {
 	}
 }
 
+func TestVersioningAlwaysBumpPatch(t *testing.T) {
+	f := newFake()
+	// a breaking change that would normally force a major bump
+	f.commits["."] = []forge.Commit{{SHA: "b1", Message: "feat!: remove a thing\n\nBREAKING CHANGE: gone"}}
+	cfg, err := config.ParseConfig([]byte(`{
+      "release-type": "simple",
+      "versioning": "always-bump-patch",
+      "packages": { ".": { "package-name": "brain" } }
+    }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	man := config.Manifest{".": "0.0.24"}
+	if err := Run(context.Background(), f, cfg, man, Options{TargetBranch: "main", Now: fixedClock()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.created) != 1 {
+		t.Fatalf("expected 1 PR, got %d", len(f.created))
+	}
+	// always-bump-patch forces 0.0.25, NOT 1.0.0 despite the breaking change
+	if !strings.Contains(f.created[0].Title, "0.0.25") {
+		t.Errorf("PR title = %q, want 0.0.25 (always-bump-patch)", f.created[0].Title)
+	}
+}
+
 func TestSeparatePullRequests(t *testing.T) {
 	f := newFake()
 	f.commits["services/api"] = []forge.Commit{{SHA: "a1", Message: "feat: api thing"}}
