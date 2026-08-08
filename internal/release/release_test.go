@@ -20,11 +20,12 @@ type fakeForge struct {
 	branches map[string]bool           // branch -> exists
 	pulls    []forge.Pull              // all PRs
 
-	puts     map[string]string // "branch\x00path" -> content written
-	created  []forge.Pull
-	releases []string // tags released
-	edits    int
-	labelSet map[int][]int64
+	puts        map[string]string // "branch\x00path" -> content written
+	commitCount int               // number of ChangeFiles commits made
+	created     []forge.Pull
+	releases    []string // tags released
+	edits       int
+	labelSet    map[int][]int64
 }
 
 func newFake() *fakeForge {
@@ -56,9 +57,22 @@ func (f *fakeForge) GetFile(_ context.Context, path, ref string) (*forge.File, e
 	}
 	return nil, notFound()
 }
-func (f *fakeForge) PutFile(_ context.Context, path, branch, content, _, _ string) error {
-	f.puts[branch+"\x00"+path] = content
-	f.files[branch+"\x00"+path] = &forge.File{Content: content, SHA: "sha-" + path}
+
+// ChangeFiles applies a multi-file commit, recording each file into puts (and
+// files, so a later GetFile on the branch reflects the write). One call =
+// one commit, mirroring the real client.
+func (f *fakeForge) ChangeFiles(_ context.Context, branch, _ string, files []forge.FileChange) error {
+	f.commitCount++
+	for _, fc := range files {
+		key := branch + "\x00" + fc.Path
+		if fc.Op == "delete" {
+			delete(f.puts, key)
+			delete(f.files, key)
+			continue
+		}
+		f.puts[key] = fc.Content
+		f.files[key] = &forge.File{Content: fc.Content, SHA: "sha-" + fc.Path}
+	}
 	return nil
 }
 func (f *fakeForge) Pulls(_ context.Context, state string) ([]forge.Pull, error) {
@@ -135,6 +149,10 @@ func TestRunFirstRelease(t *testing.T) {
 	// pending label applied
 	if ids := f.labelSet[pr.Number]; len(ids) != 1 {
 		t.Errorf("expected pending label on PR, got %v", ids)
+	}
+	// all release files land in a SINGLE commit (not one per file)
+	if f.commitCount != 1 {
+		t.Errorf("expected 1 release commit, got %d", f.commitCount)
 	}
 }
 

@@ -34,7 +34,7 @@ type API interface {
 	BranchExists(ctx context.Context, name string) (bool, error)
 	CreateBranch(ctx context.Context, name, from string) error
 	GetFile(ctx context.Context, path, ref string) (*forge.File, error)
-	PutFile(ctx context.Context, path, branch, content, prevSHA, message string) error
+	ChangeFiles(ctx context.Context, branch, message string, files []forge.FileChange) error
 	Pulls(ctx context.Context, state string) ([]forge.Pull, error)
 	CreatePull(ctx context.Context, head, base, title, body string) (*forge.Pull, error)
 	EditPull(ctx context.Context, number int, title, body string) error
@@ -201,34 +201,19 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 		}
 	}
 
-	// All file writes derive from BASE content, so re-running never stacks
-	// duplicate changelog entries onto the branch (idempotent).
-	newMan := cloneManifest(man)
-	for _, pl := range plans {
-		// changelog
-		if err := patchFile(ctx, cl, pl.pkg.ChangelogPath, opts.TargetBranch, branch, title, func(base string) string {
-			return changelog.Prepend(base, pl.entry)
-		}); err != nil {
-			return fmt.Errorf("%s: changelog: %w", label(pl.pkg), err)
-		}
-		// version-bearing files: release-type default file + extra-files
-		for _, f := range versionFiles(pl.pkg) {
-			f := f
-			if err := patchFile(ctx, cl, f, opts.TargetBranch, branch, title, func(base string) string {
-				return updater.Apply(pl.pkg.ReleaseType, f, base, pl.next.String())
-			}); err != nil {
-				return fmt.Errorf("%s: updating %s: %w", label(pl.pkg), f, err)
-			}
-		}
-		newMan[pl.pkg.Path] = pl.next.String()
-	}
-	// manifest
-	manBytes, err := newMan.Marshal()
+	// Every file's desired content derives from BASE, so re-running is
+	// idempotent. All changed files land in ONE commit (Gitea's multi-file
+	// contents API) titled with the release — not one commit per file, and
+	// not the doubled "chore(release): chore(release): …" the per-file path
+	// produced. Unchanged files are skipped, so a no-op re-run adds no commit.
+	changes, err := collectChanges(ctx, cl, man, plans, branch, opts)
 	if err != nil {
 		return err
 	}
-	if err := putFrom(ctx, cl, ".release-please-manifest.json", branch, string(manBytes), title); err != nil {
-		return fmt.Errorf("updating manifest: %w", err)
+	if len(changes) > 0 {
+		if err := cl.ChangeFiles(ctx, branch, title, changes); err != nil {
+			return fmt.Errorf("writing release commit: %w", err)
+		}
 	}
 
 	// open or refresh the PR
@@ -303,28 +288,71 @@ func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manif
 
 // ---- helpers --------------------------------------------------------------
 
-// patchFile reads the file from base, transforms it, and writes it to branch
-// (creating or overwriting). A missing base file transforms an empty string.
-func patchFile(ctx context.Context, cl API, path, base, branch, msg string, transform func(string) string) error {
-	baseContent := ""
-	if f, err := cl.GetFile(ctx, path, base); err == nil {
-		baseContent = f.Content
-	} else if !forge.NotFound(err) {
-		return err
+// collectChanges computes the desired content of every release-managed file
+// (changelog + version files + manifest) from BASE, then diffs each against the
+// branch's current content, returning the create/update operations needed. An
+// unchanged file yields no operation, so a re-run with nothing new commits
+// nothing — and everything that IS changed goes into a single commit.
+func collectChanges(ctx context.Context, cl API, man config.Manifest, plans []pkgPlan, branch string, opts Options) ([]forge.FileChange, error) {
+	newMan := cloneManifest(man)
+	var order []string
+	desired := map[string]string{}
+	want := func(path, content string) {
+		if _, seen := desired[path]; !seen {
+			order = append(order, path)
+		}
+		desired[path] = content
 	}
-	return putFrom(ctx, cl, path, branch, transform(baseContent), msg)
+
+	for _, pl := range plans {
+		base, err := readFileOr(ctx, cl, pl.pkg.ChangelogPath, opts.TargetBranch)
+		if err != nil {
+			return nil, fmt.Errorf("%s: changelog: %w", label(pl.pkg), err)
+		}
+		want(pl.pkg.ChangelogPath, changelog.Prepend(base, pl.entry))
+
+		for _, f := range versionFiles(pl.pkg) {
+			base, err := readFileOr(ctx, cl, f, opts.TargetBranch)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %s: %w", label(pl.pkg), f, err)
+			}
+			want(f, updater.Apply(pl.pkg.ReleaseType, f, base, pl.next.String()))
+		}
+		newMan[pl.pkg.Path] = pl.next.String()
+	}
+	manBytes, err := newMan.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	want(".release-please-manifest.json", string(manBytes))
+
+	var changes []forge.FileChange
+	for _, path := range order {
+		cur, err := cl.GetFile(ctx, path, branch)
+		switch {
+		case err == nil && cur.Content == desired[path]:
+			continue // already up to date on the branch
+		case err == nil:
+			changes = append(changes, forge.FileChange{Op: "update", Path: path, Content: desired[path], SHA: cur.SHA})
+		case forge.NotFound(err):
+			changes = append(changes, forge.FileChange{Op: "create", Path: path, Content: desired[path]})
+		default:
+			return nil, err
+		}
+	}
+	return changes, nil
 }
 
-// putFrom writes content to path on branch, supplying the branch file's current
-// SHA when it already exists (required by the API to overwrite).
-func putFrom(ctx context.Context, cl API, path, branch, content, msg string) error {
-	prev := ""
-	if f, err := cl.GetFile(ctx, path, branch); err == nil {
-		prev = f.SHA
-	} else if !forge.NotFound(err) {
-		return err
+// readFileOr returns the file's content at ref, or "" if it does not exist.
+func readFileOr(ctx context.Context, cl API, path, ref string) (string, error) {
+	f, err := cl.GetFile(ctx, path, ref)
+	if err != nil {
+		if forge.NotFound(err) {
+			return "", nil
+		}
+		return "", err
 	}
-	return cl.PutFile(ctx, path, branch, content, prev, "chore(release): "+msg)
+	return f.Content, nil
 }
 
 func findOpenReleasePR(ctx context.Context, cl API, branch string) (*forge.Pull, error) {

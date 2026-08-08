@@ -213,6 +213,36 @@ func (c *Client) PutFile(ctx context.Context, path, branch, content, prevSHA, me
 	return c.do(ctx, method, c.urlf("/repos/%s/%s/contents/%s", c.owner, c.repo, path), body, nil)
 }
 
+// FileChange is one file operation within a multi-file commit.
+type FileChange struct {
+	Op      string // "create" | "update" | "delete"
+	Path    string
+	Content string // raw content for create/update (ignored for delete)
+	SHA     string // the file's current blob sha; required for update/delete
+}
+
+// ChangeFiles writes several files as ONE commit on branch, via Gitea/Forgejo's
+// multi-file contents endpoint (POST /contents with a `files` array). This is
+// what keeps a release PR a single commit instead of one commit per file.
+func (c *Client) ChangeFiles(ctx context.Context, branch, message string, files []FileChange) error {
+	type apiFile struct {
+		Operation string `json:"operation"`
+		Path      string `json:"path"`
+		Content   string `json:"content,omitempty"`
+		SHA       string `json:"sha,omitempty"`
+	}
+	af := make([]apiFile, 0, len(files))
+	for _, f := range files {
+		e := apiFile{Operation: f.Op, Path: f.Path, SHA: f.SHA}
+		if f.Op != "delete" {
+			e.Content = base64.StdEncoding.EncodeToString([]byte(f.Content))
+		}
+		af = append(af, e)
+	}
+	body := map[string]any{"branch": branch, "message": message, "files": af}
+	return c.do(ctx, "POST", c.urlf("/repos/%s/%s/contents", c.owner, c.repo), body, nil)
+}
+
 // ---- branches -------------------------------------------------------------
 
 func (c *Client) BranchExists(ctx context.Context, name string) (bool, error) {
