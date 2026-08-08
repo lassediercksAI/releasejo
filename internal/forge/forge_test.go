@@ -109,11 +109,10 @@ func TestGetFileDecodeAndNotFound(t *testing.T) {
 
 func TestPutFileCreateVsUpdate(t *testing.T) {
 	var bodies []map[string]any
+	var methods []string
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wantAuth(t, r)
-		if r.Method != "PUT" {
-			t.Errorf("method = %s", r.Method)
-		}
+		methods = append(methods, r.Method)
 		var b map[string]any
 		json.NewDecoder(r.Body).Decode(&b)
 		bodies = append(bodies, b)
@@ -126,6 +125,13 @@ func TestPutFileCreateVsUpdate(t *testing.T) {
 	// update: prevSHA present -> "sha" key set
 	if err := c.PutFile(context.Background(), "a.txt", "br", "content2", "oldsha", "msg"); err != nil {
 		t.Fatal(err)
+	}
+	// Forgejo/Gitea: create is POST /contents (no sha), update is PUT (sha required).
+	if methods[0] != "POST" {
+		t.Errorf("create method = %s, want POST", methods[0])
+	}
+	if methods[1] != "PUT" {
+		t.Errorf("update method = %s, want PUT", methods[1])
 	}
 	if _, ok := bodies[0]["sha"]; ok {
 		t.Error("create should not send sha")

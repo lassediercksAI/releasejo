@@ -201,10 +201,16 @@ func (c *Client) PutFile(ctx context.Context, path, branch, content, prevSHA, me
 		"content": base64.StdEncoding.EncodeToString([]byte(content)),
 		"message": message,
 	}
+	// Forgejo/Gitea splits create vs update: POST /contents creates a new file
+	// (no sha), PUT /contents updates an existing one (sha REQUIRED — it 422s
+	// with "[SHA]: Required" otherwise). Pick the verb by whether the file was
+	// already present on the branch (prevSHA is its blob sha, "" when absent).
+	method := "POST"
 	if prevSHA != "" {
+		method = "PUT"
 		body["sha"] = prevSHA
 	}
-	return c.do(ctx, "PUT", c.urlf("/repos/%s/%s/contents/%s", c.owner, c.repo, path), body, nil)
+	return c.do(ctx, method, c.urlf("/repos/%s/%s/contents/%s", c.owner, c.repo, path), body, nil)
 }
 
 // ---- branches -------------------------------------------------------------
