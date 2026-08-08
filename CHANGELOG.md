@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.2 (2026-08-08)
+
+
+### Bug Fixes
+
+* **forge:** create files with POST — Forgejo/Gitea's `PUT /contents` requires a `sha`, so first-time writes (CHANGELOG.md, version.txt, manifest on a fresh release branch) 422'd with "[SHA]: Required". Verified live against Forgejo 16.0.2 (gitea-1.22): release PR now opens end-to-end.
+
 ## 0.0.1 (2026-08-06)
 
 
