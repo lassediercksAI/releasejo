@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.4](https://github.com/lassediercksAI/releasejo/compare/v0.0.3...v0.0.4) (2026-08-09)
+
+
+### Bug Fixes
+
+* rebuild release branch from base each run (never reset → frozen tree + stacked commits) ([7d592a1](https://github.com/lassediercksAI/releasejo/commit/7d592a19c78048eb9268b35b9d0ad37519e25c39))
+
 ## 0.0.3 (2026-08-08)
 
 
