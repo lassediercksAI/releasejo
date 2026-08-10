@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.5](https://github.com/lassediercksAI/releasejo/compare/v0.0.4...v0.0.5) (2026-08-10)
+
+
+### Bug Fixes
+
+* release on perf and revert (patch), matching release-please ([66af464](https://github.com/lassediercksAI/releasejo/commit/66af464ce55f3c9b6204f8d77106142292abb348))
+
 ## [0.0.4](https://github.com/lassediercksAI/releasejo/compare/v0.0.3...v0.0.4) (2026-08-09)
 
 
