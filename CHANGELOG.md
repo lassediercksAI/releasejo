@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.10](https://github.com/lassediercksAI/releasejo/compare/v0.0.9...v0.0.10) (2026-10-22)
+
+
+### Bug Fixes
+
+* **release:** tag the version a release PR merged, at its merge commit ([#13](https://github.com/lassediercksAI/releasejo/issues/13)) ([1a3885a](https://github.com/lassediercksAI/releasejo/commit/1a3885a9cf5184d194ad973b0258652aa95f33d8))
+
 ## [0.0.9](https://github.com/lassediercksAI/releasejo/compare/v0.0.8...v0.0.9) (2026-10-19)
 
 
