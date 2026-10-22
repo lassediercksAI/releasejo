@@ -294,8 +294,20 @@ func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manif
 			continue
 		}
 		opts.Logf("release PR #%d merged (%s); cutting releases", pr.Number, short(pr.MergeCommitSHA))
+		// The versions to tag are the ones the release PR merged, read from its
+		// merge commit — not from this run's checkout. A run that started
+		// before the PR was merged checked out the previous manifest; tagging
+		// from that finds the previous tag already there, cuts nothing, and
+		// would still mark the PR tagged, losing the release. Tags and notes
+		// also point at the merge commit, not wherever the branch is now.
+		relMan, at, err := manifestAt(ctx, cl, man, pr, opts)
+		if err != nil {
+			return err
+		}
+		atOpts := opts
+		atOpts.TargetBranch = at
 		for _, p := range cfg.Packages {
-			v, err := semver.Parse(orZero(man[p.Path]))
+			v, err := semver.Parse(orZero(relMan[p.Path]))
 			if err != nil {
 				return err
 			}
@@ -313,12 +325,12 @@ func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manif
 			if existing != "" {
 				continue // already released
 			}
-			notes := extractEntry(changelogOnMain(ctx, cl, p, opts), v.String())
+			notes := extractEntry(changelogOnMain(ctx, cl, p, atOpts), v.String())
 			if opts.DryRun {
 				opts.Logf("[dry-run] would create release %s", tag)
 				continue
 			}
-			if err := cl.CreateRelease(ctx, tag, opts.TargetBranch, tag, notes, v.IsPrerelease()); err != nil {
+			if err := cl.CreateRelease(ctx, tag, at, tag, notes, v.IsPrerelease()); err != nil {
 				return fmt.Errorf("creating release %s: %w", tag, err)
 			}
 			opts.Logf("created release %s", tag)
@@ -338,6 +350,30 @@ func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manif
 }
 
 // ---- helpers --------------------------------------------------------------
+
+// manifestFile is where the version manifest lives in the repository.
+const manifestFile = ".release-please-manifest.json"
+
+// manifestAt returns the manifest a merged release PR left behind and the ref
+// to release from: its merge commit. Without a merge commit SHA (or without a
+// manifest there) it falls back to the run's own manifest and target branch.
+func manifestAt(ctx context.Context, cl API, man config.Manifest, pr forge.Pull, opts Options) (config.Manifest, string, error) {
+	if pr.MergeCommitSHA == "" {
+		return man, opts.TargetBranch, nil
+	}
+	f, err := cl.GetFile(ctx, manifestFile, pr.MergeCommitSHA)
+	if forge.NotFound(err) {
+		return man, pr.MergeCommitSHA, nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("manifest at %s: %w", short(pr.MergeCommitSHA), err)
+	}
+	m, err := config.ParseManifest([]byte(f.Content))
+	if err != nil {
+		return nil, "", fmt.Errorf("manifest at %s: %w", short(pr.MergeCommitSHA), err)
+	}
+	return m, pr.MergeCommitSHA, nil
+}
 
 // collectChanges computes the desired content of every release-managed file
 // (changelog + version files + manifest) from BASE, then diffs each against the
@@ -375,7 +411,7 @@ func collectChanges(ctx context.Context, cl API, man config.Manifest, plans []pk
 	if err != nil {
 		return nil, err
 	}
-	want(".release-please-manifest.json", string(manBytes))
+	want(manifestFile, string(manBytes))
 
 	var changes []forge.FileChange
 	for _, path := range order {

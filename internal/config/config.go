@@ -152,6 +152,11 @@ func LoadManifest(path string) (Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("manifest: %w", err)
 	}
+	return ParseManifest(b)
+}
+
+// ParseManifest decodes manifest JSON, e.g. as read from a commit.
+func ParseManifest(b []byte) (Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("manifest: invalid JSON: %w", err)

@@ -28,6 +28,7 @@ type fakeForge struct {
 	commitCount int               // number of ChangeFiles commits made
 	created     []forge.Pull
 	releases    []string // tags released
+	targets     []string // target ref of each release, in order
 	edits       int
 	edited      []int // PR numbers passed to EditPull, in order
 	deletes     int   // number of DeleteBranch (reset) calls
@@ -145,8 +146,9 @@ func (f *fakeForge) SetIssueLabels(_ context.Context, number int, ids []int64) e
 	f.labelSet[number] = ids
 	return nil
 }
-func (f *fakeForge) CreateRelease(_ context.Context, tag, _, _, _ string, _ bool) error {
+func (f *fakeForge) CreateRelease(_ context.Context, tag, target, _, _ string, _ bool) error {
 	f.releases = append(f.releases, tag)
+	f.targets = append(f.targets, target)
 	return nil
 }
 
@@ -334,6 +336,36 @@ func TestTagOnMerge(t *testing.T) {
 	}
 	// PR relabelled to tagged (label id 7 set)
 	if _, ok := f.labelSet[42]; !ok {
+		t.Error("expected merged PR to be relabelled tagged")
+	}
+}
+
+// A run that checked out the branch BEFORE the release PR was merged still
+// holds the previous manifest. It must tag the version the PR merged (read at
+// the merge commit), on the merge commit — not find the previous tag already
+// there, cut nothing and mark the PR tagged anyway.
+func TestTagOnMergeReadsTheManifestAtTheMergeCommit(t *testing.T) {
+	f := newFake()
+	merged := forge.Pull{Number: 74, State: "closed", Merged: true, MergeCommitSHA: "m055",
+		Labels: []forge.Label{{ID: 7, Name: pendingLabel}}}
+	f.pulls = []forge.Pull{merged}
+	f.tags["v0.54.0"] = "old"
+	stale := config.Manifest{".": "0.54.0"} // this run's checkout
+	f.files["m055\x00.release-please-manifest.json"] = &forge.File{Content: "{\n  \".\": \"0.55.0\"\n}\n"}
+	f.files["m055\x00CHANGELOG.md"] = &forge.File{
+		Content: "# Changelog\n\n## 0.55.0 (2026-10-22)\n\n### Features\n\n* bill anywhere (c2)\n",
+	}
+
+	if err := Run(context.Background(), f, goConfig(), stale, Options{TargetBranch: "main", Now: fixedClock()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.releases) != 1 || f.releases[0] != "v0.55.0" {
+		t.Fatalf("expected release v0.55.0, got %v", f.releases)
+	}
+	if f.targets[0] != "m055" {
+		t.Errorf("release target = %q, want the merge commit m055", f.targets[0])
+	}
+	if _, ok := f.labelSet[74]; !ok {
 		t.Error("expected merged PR to be relabelled tagged")
 	}
 }
