@@ -141,8 +141,17 @@ func computePlans(ctx context.Context, cl API, cfg *config.Config, man config.Ma
 		var ccs []conventional.Commit
 		level := semver.None
 		for _, rc := range raw {
+			// Membership, not position, decides what was released. The list is
+			// ordered by date, so a commit authored before the tag but merged
+			// after it (a rebased or long-lived branch) sits below the tag
+			// commit; stopping at the tag would drop it from every future
+			// release. Stop at the tag only when the tag's history could not
+			// be listed (a tag's own history always contains the tag commit).
 			if boundary != "" && rc.SHA == boundary {
-				break // reached the last release
+				if len(released) == 0 {
+					break
+				}
+				continue
 			}
 			if released[rc.SHA] {
 				continue // already part of the last release

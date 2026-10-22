@@ -807,3 +807,38 @@ func TestTagOnMergeSkipsUnreleasedPackages(t *testing.T) {
 		t.Fatalf("expected only csrf/v0.0.1, got %v", f.releases)
 	}
 }
+
+// A commit authored before the last release but merged after it lists below
+// the tag commit in date order. It is still unreleased and must count.
+func TestCommitMergedAfterTagButAuthoredBeforeIsReleased(t *testing.T) {
+	f := newFake()
+	old := forge.Commit{SHA: "o1", Message: "feat: shipped in 1.0.0"}
+	tag := forge.Commit{SHA: "t1", Message: "chore(release): 1.0.0"}
+	late := forge.Commit{SHA: "f1", Message: "fix: lost purchase mail"}
+	merge := forge.Commit{SHA: "m2", Message: "Merge pull request 'fix: lost purchase mail' (#94)"}
+	f.commits["."] = []forge.Commit{merge, tag, late, old} // newest first, by date
+	f.tags["1.0.0"] = "t1"
+	f.commitsAt["t1\x00."] = []forge.Commit{tag, old}
+	cfg, err := config.ParseConfig([]byte(`{
+      "release-type": "go",
+      "include-v-in-tag": false,
+      "packages": { ".": {} }
+    }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	man := config.Manifest{".": "1.0.0"}
+	if err := Run(context.Background(), f, cfg, man, Options{TargetBranch: "main", Now: fixedClock()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.created) != 1 {
+		t.Fatalf("want one release PR for the late fix, got %d", len(f.created))
+	}
+	pr := f.created[0]
+	if pr.Title != "chore(release): 1.0.1" {
+		t.Errorf("title = %q, want chore(release): 1.0.1", pr.Title)
+	}
+	if !strings.Contains(pr.Body, "lost purchase mail") || strings.Contains(pr.Body, "shipped in 1.0.0") {
+		t.Errorf("changelog should hold only the late fix:\n%s", pr.Body)
+	}
+}
