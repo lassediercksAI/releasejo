@@ -80,11 +80,22 @@ type pkgPlan struct {
 func Run(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) error {
 	opts.defaults()
 
-	if err := tagMerged(ctx, cl, cfg, man, opts); err != nil {
+	cut, err := tagMerged(ctx, cl, cfg, man, opts)
+	if err != nil {
 		return fmt.Errorf("tagging merged release: %w", err)
 	}
 
-	plans, err := computePlans(ctx, cl, cfg, man, opts)
+	// Plan against main as it is now, not this run's checkout. A run that
+	// checked out main just before a release PR merged still holds the
+	// previous manifest, while the commits it lists come from the live
+	// branch: it would tag the merged release above and then propose the
+	// very same version again from the old tag (website #111, #114, #120).
+	man, err = liveManifest(ctx, cl, man, cut, opts)
+	if err != nil {
+		return err
+	}
+
+	plans, err := computePlans(ctx, cl, cfg, man, cut, opts)
 	if err != nil {
 		return err
 	}
@@ -110,7 +121,7 @@ func TagFor(cfg *config.Config, p config.Package, v semver.Version) string {
 
 // computePlans figures out, per package, the next version + changelog from the
 // commits since that package's last release tag.
-func computePlans(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) ([]pkgPlan, error) {
+func computePlans(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, cut map[string]cutRelease, opts Options) ([]pkgPlan, error) {
 	var plans []pkgPlan
 	date := opts.Now().UTC().Format("2006-01-02")
 
@@ -119,9 +130,15 @@ func computePlans(ctx context.Context, cl API, cfg *config.Config, man config.Ma
 		if err != nil {
 			return nil, fmt.Errorf("package %q: manifest version: %w", p.Path, err)
 		}
-		boundary, err := cl.TagCommit(ctx, TagFor(cfg, p, last))
+		tag := TagFor(cfg, p, last)
+		boundary, err := cl.TagCommit(ctx, tag)
 		if err != nil {
 			return nil, fmt.Errorf("package %q: resolving last tag: %w", p.Path, err)
+		}
+		// A tag this run just cut may not be listed yet; it sits on the
+		// release PR's merge commit.
+		if c, ok := cut[p.Path]; boundary == "" && ok && c.tag == tag {
+			boundary = c.at
 		}
 
 		raw, err := cl.Commits(ctx, opts.TargetBranch, p.Path, opts.MaxCommits)
@@ -291,12 +308,22 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 	return cl.SetIssueLabels(ctx, created.Number, []int64{id})
 }
 
+// cutRelease is a version a merged release PR released, and the commit its
+// tag sits on.
+type cutRelease struct {
+	version semver.Version
+	tag     string
+	at      string
+}
+
 // tagMerged looks for a just-merged release PR and cuts the tags/releases its
 // merge introduced (versions now present in main's manifest but not yet tagged).
-func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) error {
+// It returns, per package path, the newest version those merges released.
+func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) (map[string]cutRelease, error) {
+	cut := map[string]cutRelease{}
 	closed, err := cl.Pulls(ctx, "closed")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, pr := range closed {
 		if !pr.Merged || !hasLabel(pr, pendingLabel) || hasLabel(pr, taggedLabel) {
@@ -311,14 +338,14 @@ func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manif
 		// also point at the merge commit, not wherever the branch is now.
 		relMan, at, err := manifestAt(ctx, cl, man, pr, opts)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		atOpts := opts
 		atOpts.TargetBranch = at
 		for _, p := range cfg.Packages {
 			v, err := semver.Parse(orZero(relMan[p.Path]))
 			if err != nil {
-				return err
+				return nil, err
 			}
 			// 0.0.0 is the manifest's "never released" placeholder, not a
 			// version anyone merged. Tagging it would mark every commit as
@@ -329,7 +356,14 @@ func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manif
 			tag := TagFor(cfg, p, v)
 			existing, err := cl.TagCommit(ctx, tag)
 			if err != nil {
-				return err
+				return nil, err
+			}
+			if c, ok := cut[p.Path]; !ok || v.Compare(c.version) > 0 {
+				c = cutRelease{version: v, tag: tag, at: at}
+				if existing != "" {
+					c.at = existing
+				}
+				cut[p.Path] = c
 			}
 			if existing != "" {
 				continue // already released
@@ -340,22 +374,48 @@ func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manif
 				continue
 			}
 			if err := cl.CreateRelease(ctx, tag, at, tag, notes, v.IsPrerelease()); err != nil {
-				return fmt.Errorf("creating release %s: %w", tag, err)
+				return nil, fmt.Errorf("creating release %s: %w", tag, err)
 			}
 			opts.Logf("created release %s", tag)
 		}
 		if !opts.DryRun {
 			id, err := cl.EnsureLabel(ctx, taggedLabel, labelColor)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			// keep pending removed by replacing labels with just "tagged"
 			if err := cl.SetIssueLabels(ctx, pr.Number, []int64{id}); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
-	return nil
+	return cut, nil
+}
+
+// liveManifest returns the manifest on the target branch now, falling back to
+// the run's checkout when the branch has none, raised to any version this run
+// just released (the branch read can trail the merge it was cut from).
+func liveManifest(ctx context.Context, cl API, man config.Manifest, cut map[string]cutRelease, opts Options) (config.Manifest, error) {
+	live := cloneManifest(man)
+	f, err := cl.GetFile(ctx, manifestFile, opts.TargetBranch)
+	switch {
+	case forge.NotFound(err):
+	case err != nil:
+		return nil, fmt.Errorf("manifest on %s: %w", opts.TargetBranch, err)
+	default:
+		m, err := config.ParseManifest([]byte(f.Content))
+		if err != nil {
+			return nil, fmt.Errorf("manifest on %s: %w", opts.TargetBranch, err)
+		}
+		live = m
+	}
+	for path, c := range cut {
+		cur, err := semver.Parse(orZero(live[path]))
+		if err != nil || c.version.Compare(cur) > 0 {
+			live[path] = c.version.String()
+		}
+	}
+	return live, nil
 }
 
 // ---- helpers --------------------------------------------------------------
