@@ -10,6 +10,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      assets_tag:
+        description: "Build and upload the binaries for this existing tag (e.g. v0.0.10) instead of releasing"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -17,9 +22,54 @@ permissions:
 
 jobs:
   release-please:
+    if: inputs.assets_tag == ''
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - id: rp
+        uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  # The binaries the website and brain workflows download and pin by
+  # sha256: releasejo-linux-{amd64,arm64} and SHA256SUMS, attached to the
+  # release release-please just made. Static, stripped, -trimpath — the
+  # same build the hand-uploaded v0.0.9 and v0.0.10 assets used. A manual
+  # run with assets_tag rebuilds them for an existing tag (--clobber
+  # replaces what is there).
+  assets:
+    needs: release-please
+    if: >-
+      always() &&
+      (needs.release-please.outputs.release_created == 'true' || inputs.assets_tag != '')
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.assets_tag || needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          # The tag must be there for Go to stamp the binary with it.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+          cache: false
+      - name: Build
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
+              go build -trimpath -ldflags="-s -w" -o "dist/releasejo-linux-$arch" ./cmd/releasejo
+          done
+          cd dist && sha256sum releasejo-linux-amd64 releasejo-linux-arm64 > SHA256SUMS && cat SHA256SUMS
+          go version -m releasejo-linux-amd64 | grep -E "^\s+mod\s" | grep -q "${TAG}" \
+            || { echo "binary does not carry ${TAG}"; go version -m releasejo-linux-amd64; exit 1; }
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/releasejo-linux-amd64 dist/releasejo-linux-arm64 dist/SHA256SUMS --clobber
