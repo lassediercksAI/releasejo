@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.11](https://github.com/lassediercksAI/releasejo/compare/v0.0.10...v0.0.11) (2026-10-23)
+
+
+### Bug Fixes
+
+* **release:** count commits merged after the tag even when authored before it ([#16](https://github.com/lassediercksAI/releasejo/issues/16)) ([bcbc7ee](https://github.com/lassediercksAI/releasejo/commit/bcbc7ee75f891d039700fc39166821f60e29ec27))
+
 ## [0.0.10](https://github.com/lassediercksAI/releasejo/compare/v0.0.9...v0.0.10) (2026-10-22)
 
 
