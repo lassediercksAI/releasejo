@@ -37,6 +37,7 @@ type API interface {
 	GetFile(ctx context.Context, path, ref string) (*forge.File, error)
 	ChangeFiles(ctx context.Context, branch, message string, files []forge.FileChange) error
 	Pulls(ctx context.Context, state string) ([]forge.Pull, error)
+	GetPull(ctx context.Context, number int) (*forge.Pull, error)
 	CreatePull(ctx context.Context, head, base, title, body string) (*forge.Pull, error)
 	EditPull(ctx context.Context, number int, title, body string) error // refreshes AND reopens
 	EnsureLabel(ctx context.Context, name, color string) (int64, error)
@@ -51,6 +52,11 @@ type Options struct {
 	DryRun       bool
 	Now          func() time.Time
 	Logf         func(string, ...any)
+	// CloseWait bounds the wait for Forgejo to close the release PR after
+	// its head branch is reset (default 30s), polling every PollEvery
+	// (default 1s).
+	CloseWait time.Duration
+	PollEvery time.Duration
 }
 
 func (o *Options) defaults() {
@@ -62,6 +68,12 @@ func (o *Options) defaults() {
 	}
 	if o.Logf == nil {
 		o.Logf = func(string, ...any) {}
+	}
+	if o.CloseWait == 0 {
+		o.CloseWait = 30 * time.Second
+	}
+	if o.PollEvery == 0 {
+		o.PollEvery = time.Second
 	}
 }
 
@@ -270,6 +282,15 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 		if err := cl.DeleteBranch(ctx, branch); err != nil {
 			return fmt.Errorf("resetting release branch to base: %w", err)
 		}
+		// Forgejo closes the PR from a queue, so the close can land after
+		// the refresh below has "reopened" a PR that was still open, which
+		// leaves it closed with no release PR at all (website #161, ogof
+		// #362). Wait for the close before reopening.
+		if pr != nil && pr.State == "open" {
+			if err := awaitClosed(ctx, cl, pr.Number, opts); err != nil {
+				return err
+			}
+		}
 	}
 	if err := cl.CreateBranch(ctx, branch, opts.TargetBranch); err != nil {
 		return fmt.Errorf("creating release branch: %w", err)
@@ -294,7 +315,17 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 	// open one if there is none.
 	if pr != nil {
 		opts.Logf("refreshing release PR #%d (was %s)", pr.Number, prState(pr))
-		return cl.EditPull(ctx, pr.Number, title, body)
+		if err := cl.EditPull(ctx, pr.Number, title, body); err != nil {
+			return err
+		}
+		got, err := cl.GetPull(ctx, pr.Number)
+		if err != nil {
+			return err
+		}
+		if got.State != "open" {
+			return fmt.Errorf("release PR #%d is %s after the refresh, not open", pr.Number, prState(got))
+		}
+		return nil
 	}
 	created, err := cl.CreatePull(ctx, branch, opts.TargetBranch, title, body)
 	if err != nil {
@@ -542,6 +573,31 @@ func findReleasePR(ctx context.Context, cl API, branch string) (*forge.Pull, err
 		}
 	}
 	return closed, nil
+}
+
+// awaitClosed waits until Forgejo has closed PR number after its head branch
+// was deleted. A close that doesn't come within CloseWait is logged and not
+// waited for further: the refresh then reopens nothing, which is fine.
+func awaitClosed(ctx context.Context, cl API, number int, opts Options) error {
+	deadline := time.Now().Add(opts.CloseWait)
+	for {
+		p, err := cl.GetPull(ctx, number)
+		if err != nil {
+			return err
+		}
+		if p.State != "open" {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			opts.Logf("release PR #%d still open %s after its branch was reset", number, opts.CloseWait)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(opts.PollEvery):
+		}
+	}
 }
 
 // prState renders a PR's state for logs ("open"/"closed"), tolerating an
