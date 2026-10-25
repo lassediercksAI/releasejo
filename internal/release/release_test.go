@@ -842,3 +842,71 @@ func TestCommitMergedAfterTagButAuthoredBeforeIsReleased(t *testing.T) {
 		t.Errorf("changelog should hold only the late fix:\n%s", pr.Body)
 	}
 }
+
+// The run that tags a release can be one that checked out main just before
+// the release PR merged: its manifest still holds the previous version while
+// the commits it lists come from the live branch. It must not propose the
+// version it just tagged again (website #111, #114, #120).
+func TestRunThatTagsAReleaseDoesNotProposeItAgain(t *testing.T) {
+	f := newFake()
+	merged := forge.Pull{Number: 119, State: "closed", Merged: true, MergeCommitSHA: "m067",
+		Labels: []forge.Label{{ID: 7, Name: pendingLabel}}}
+	f.pulls = []forge.Pull{merged}
+	f.tags["v0.66.1"] = "t661"
+	f.files["m067\x00.release-please-manifest.json"] = &forge.File{Content: "{\n  \".\": \"0.67.0\"\n}\n"}
+	f.files["m067\x00CHANGELOG.md"] = &forge.File{
+		Content: "# Changelog\n\n## 0.67.0 (2026-10-23)\n\n### Features\n\n* products filter (f2)\n",
+	}
+	rel := forge.Commit{SHA: "m067", Message: "chore(release): 0.67.0 (#119)"}
+	feat := forge.Commit{SHA: "f2", Message: "feat: products filter"}
+	fix := forge.Commit{SHA: "f1", Message: "fix: no shore fade"}
+	tag := forge.Commit{SHA: "t661", Message: "chore(release): 0.66.1"}
+	f.commits["."] = []forge.Commit{rel, feat, fix, tag}
+	f.commitsAt["t661\x00."] = []forge.Commit{tag}
+	f.commitsAt["m067\x00."] = []forge.Commit{rel, feat, fix, tag}
+	stale := config.Manifest{".": "0.66.1"} // checked out before #119 merged
+	l := &logSink{}
+
+	if err := Run(context.Background(), f, goConfig(), stale, Options{TargetBranch: "main", Now: fixedClock(), Logf: l.logf}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.releases) != 1 || f.releases[0] != "v0.67.0" {
+		t.Fatalf("expected release v0.67.0, got %v", f.releases)
+	}
+	if len(f.created) != 0 {
+		t.Fatalf("proposed %q again right after tagging it", f.created[0].Title)
+	}
+	if !strings.Contains(l.text(), "nothing to release") {
+		t.Errorf("expected nothing to release, log:\n%s", l.text())
+	}
+}
+
+// A later run whose checkout trails main plans from main's manifest: only the
+// commits after the newest release count.
+func TestStaleCheckoutPlansFromMainsManifest(t *testing.T) {
+	f := newFake()
+	f.tags["v0.66.1"] = "t661"
+	f.tags["v0.67.0"] = "m067"
+	f.files["main\x00.release-please-manifest.json"] = &forge.File{Content: "{\n  \".\": \"0.67.0\"\n}\n"}
+	next := forge.Commit{SHA: "f3", Message: "feat: map of shores"}
+	rel := forge.Commit{SHA: "m067", Message: "chore(release): 0.67.0 (#119)"}
+	feat := forge.Commit{SHA: "f2", Message: "feat: products filter"}
+	tag := forge.Commit{SHA: "t661", Message: "chore(release): 0.66.1"}
+	f.commits["."] = []forge.Commit{next, rel, feat, tag}
+	f.commitsAt["t661\x00."] = []forge.Commit{tag}
+	f.commitsAt["m067\x00."] = []forge.Commit{rel, feat, tag}
+
+	if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.66.1"}, Options{TargetBranch: "main", Now: fixedClock()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.created) != 1 {
+		t.Fatalf("want one release PR, got %d", len(f.created))
+	}
+	pr := f.created[0]
+	if pr.Title != "chore(release): 0.68.0" {
+		t.Errorf("title = %q, want chore(release): 0.68.0", pr.Title)
+	}
+	if !strings.Contains(pr.Body, "map of shores") || strings.Contains(pr.Body, "products filter") {
+		t.Errorf("changelog should hold only the commit after 0.67.0:\n%s", pr.Body)
+	}
+}
