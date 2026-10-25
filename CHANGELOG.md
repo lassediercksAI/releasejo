@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.13](https://github.com/lassediercksAI/releasejo/compare/v0.0.12...v0.0.13) (2026-10-25)
+
+
+### Bug Fixes
+
+* **release:** wait for Forgejo's queued close before reopening the release PR ([#20](https://github.com/lassediercksAI/releasejo/issues/20)) ([1ddb816](https://github.com/lassediercksAI/releasejo/commit/1ddb81679fd333c33f69dbe3f2ca1095fa840ea9))
+
 ## [0.0.12](https://github.com/lassediercksAI/releasejo/compare/v0.0.11...v0.0.12) (2026-10-25)
 
 
