@@ -33,6 +33,11 @@ type fakeForge struct {
 	edited      []int // PR numbers passed to EditPull, in order
 	deletes     int   // number of DeleteBranch (reset) calls
 	closedBy    int   // PRs auto-closed because their head branch was deleted
+	// queuedClose makes the close Forgejo does on a branch delete land
+	// late, as it does from Forgejo's queue: on the queuedClose-th GetPull
+	// of that PR, or at flush.
+	queuedClose int
+	pending     map[int]int // PR number -> GetPull calls left before it closes
 	labelSet    map[int][]int64
 }
 
@@ -84,11 +89,49 @@ func (f *fakeForge) DeleteBranch(_ context.Context, name string) error {
 	f.deletes++
 	for i := range f.pulls {
 		if f.pulls[i].Head.Ref == name && f.pulls[i].State == "open" && !f.pulls[i].Merged {
+			if f.queuedClose > 0 {
+				if f.pending == nil {
+					f.pending = map[int]int{}
+				}
+				f.pending[f.pulls[i].Number] = f.queuedClose
+				continue
+			}
 			f.pulls[i].State = "closed"
 			f.closedBy++
 		}
 	}
 	return nil
+}
+
+func (f *fakeForge) GetPull(_ context.Context, number int) (*forge.Pull, error) {
+	p := f.pull(number)
+	if p == nil {
+		return nil, notFound()
+	}
+	if left, ok := f.pending[number]; ok {
+		if left <= 1 {
+			f.closeQueued(number)
+		} else {
+			f.pending[number] = left - 1
+		}
+	}
+	cp := *p
+	return &cp, nil
+}
+
+func (f *fakeForge) closeQueued(number int) {
+	delete(f.pending, number)
+	if p := f.pull(number); p != nil && p.State == "open" {
+		p.State = "closed"
+		f.closedBy++
+	}
+}
+
+// flush lands every close still in the queue, as Forgejo does after the run.
+func (f *fakeForge) flush() {
+	for n := range f.pending {
+		f.closeQueued(n)
+	}
 }
 func (f *fakeForge) GetFile(_ context.Context, path, ref string) (*forge.File, error) {
 	if file, ok := f.files[ref+"\x00"+path]; ok {
@@ -908,5 +951,54 @@ func TestStaleCheckoutPlansFromMainsManifest(t *testing.T) {
 	}
 	if !strings.Contains(pr.Body, "map of shores") || strings.Contains(pr.Body, "products filter") {
 		t.Errorf("changelog should hold only the commit after 0.67.0:\n%s", pr.Body)
+	}
+}
+
+// Forgejo closes the PR of a deleted head branch from a queue. When that
+// close lands after the refresh, a "reopen" of the still-open PR does
+// nothing and the PR ends up closed, with no release PR at all (website
+// #161: "refreshing release PR #161 (was open)", closed 2 s later). The run
+// must wait for the close, then reopen.
+func TestRefreshWaitsForTheQueuedClose(t *testing.T) {
+	f := newFake()
+	f.queuedClose = 3
+	f.commits["."] = []forge.Commit{{SHA: "c1", Message: "fix: privacy hotfix"}}
+	f.branches[releaseBranch] = true
+	f.pulls = []forge.Pull{pendingPull(161, "open", forge.Label{ID: 7, Name: pendingLabel})}
+	opts := Options{TargetBranch: "main", Now: fixedClock(), PollEvery: time.Millisecond}
+	if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.0.6"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	f.flush() // whatever is still queued lands after the run
+
+	if f.closedBy != 1 {
+		t.Fatalf("expected the queued close to land once, closedBy=%d", f.closedBy)
+	}
+	if pr := f.pull(161); pr == nil || pr.State != "open" {
+		t.Fatalf("PR #161 must be open after the queued close, got %+v", pr)
+	}
+	if len(f.created) != 0 {
+		t.Errorf("expected #161 to be reused, %d PRs opened", len(f.created))
+	}
+}
+
+// A close that never comes is not waited for forever.
+func TestRefreshDoesNotWaitForeverForTheClose(t *testing.T) {
+	f := newFake()
+	f.queuedClose = 1 << 30
+	f.commits["."] = []forge.Commit{{SHA: "c1", Message: "fix: correct a boundary check"}}
+	f.branches[releaseBranch] = true
+	f.pulls = []forge.Pull{pendingPull(93, "open", forge.Label{ID: 7, Name: pendingLabel})}
+	l := &logSink{}
+	opts := Options{TargetBranch: "main", Now: fixedClock(), Logf: l.logf,
+		CloseWait: 20 * time.Millisecond, PollEvery: time.Millisecond}
+	if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.0.6"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(l.text(), "still open") {
+		t.Errorf("expected the wait to give up and say so, log:\n%s", l.text())
+	}
+	if pr := f.pull(93); pr == nil || pr.State != "open" {
+		t.Fatalf("PR #93 must be open, got %+v", pr)
 	}
 }

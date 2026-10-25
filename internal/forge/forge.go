@@ -297,6 +297,15 @@ func (c *Client) Pulls(ctx context.Context, state string) ([]Pull, error) {
 	return out, err
 }
 
+// GetPull returns one PR.
+func (c *Client) GetPull(ctx context.Context, number int) (*Pull, error) {
+	var out Pull
+	if err := c.do(ctx, "GET", c.urlf("/repos/%s/%s/pulls/%d", c.owner, c.repo, number), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) CreatePull(ctx context.Context, head, base, title, body string) (*Pull, error) {
 	req := map[string]any{"head": head, "base": base, "title": title, "body": body}
 	var p Pull
