@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.12](https://github.com/lassediercksAI/releasejo/compare/v0.0.11...v0.0.12) (2026-10-25)
+
+
+### Bug Fixes
+
+* **release:** plan from main's manifest so a tagging run doesn't re-propose its release ([#18](https://github.com/lassediercksAI/releasejo/issues/18)) ([576bcb6](https://github.com/lassediercksAI/releasejo/commit/576bcb68e6ea820c8c9ac27bd66e2b87b7777e4a))
+
 ## [0.0.11](https://github.com/lassediercksAI/releasejo/compare/v0.0.10...v0.0.11) (2026-10-23)
 
 
