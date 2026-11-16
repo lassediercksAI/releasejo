@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.15](https://github.com/lassediercksAI/releasejo/compare/v0.0.14...v0.0.15) (2026-11-16)
+
+
+### Bug Fixes
+
+* **release:** keep a reopened closed release PR open when the queued branch close lands after it ([#24](https://github.com/lassediercksAI/releasejo/issues/24)) ([664a829](https://github.com/lassediercksAI/releasejo/commit/664a82908cb81778ebefb6e870f9c672e81aa9a7))
+
 ## [0.0.14](https://github.com/lassediercksAI/releasejo/compare/v0.0.13...v0.0.14) (2026-11-16)
 
 
