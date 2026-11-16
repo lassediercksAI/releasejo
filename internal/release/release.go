@@ -292,6 +292,7 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 	if err != nil {
 		return err
 	}
+	awaited := false
 	if exists {
 		if err := cl.DeleteBranch(ctx, branch); err != nil {
 			return fmt.Errorf("resetting release branch to base: %w", err)
@@ -305,6 +306,7 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 			if err := awaitClosed(ctx, cl, pr.Number, opts); err != nil {
 				return err
 			}
+			awaited = true
 		}
 	}
 	if err := cl.CreateBranch(ctx, branch, opts.TargetBranch); err != nil {
@@ -332,6 +334,11 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 		opts.Logf("refreshing release PR #%d (was %s)", pr.Number, prState(pr))
 		if err := cl.EditPull(ctx, pr.Number, title, body); err != nil {
 			return err
+		}
+		// A PR that was already closed had no close to wait for above, so
+		// the delete's queued close can still land after the reopen.
+		if deleted[branch] && !awaited {
+			return keepOpen(ctx, cl, pr.Number, title, body, opts)
 		}
 		got, err := cl.GetPull(ctx, pr.Number)
 		if err != nil {

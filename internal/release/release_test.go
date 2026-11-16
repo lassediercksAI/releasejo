@@ -1132,3 +1132,32 @@ func TestTagOnMergeKeepsABranchAnOpenPRUses(t *testing.T) {
 		t.Fatalf("branch of open PR #24 must be kept, exists=%v deletes=%d", f.branches[releaseBranch], f.deletes)
 	}
 }
+
+// pupil #24 after the fact: the release PR is closed (the queued close took
+// it) and its branch is still there. The refresh deletes the branch and
+// reopens the PR, and the queued close for that delete lands after the reopen.
+// The run must reopen it again and leave it open.
+func TestRefreshOfClosedPRSurvivesQueuedClose(t *testing.T) {
+	f := newFake()
+	f.queuedBranchClose = 2
+	f.commits["."] = []forge.Commit{{SHA: "c2", Message: "feat: in a topic, how close the exam is"}}
+	f.tags["v0.18.0"] = "m23"
+	f.branches[releaseBranch] = true
+	f.pulls = []forge.Pull{pendingPull(24, "closed", forge.Label{ID: 7, Name: pendingLabel})}
+	l := &logSink{}
+	opts := Options{TargetBranch: "main", Now: fixedClock(), Logf: l.logf, PollEvery: time.Millisecond, SettleWait: time.Second}
+	if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.18.0"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	f.flush()
+
+	if len(f.created) != 0 {
+		t.Fatalf("expected #24 to be reused, %d PRs opened", len(f.created))
+	}
+	if f.closedBy != 1 {
+		t.Fatalf("expected the queued close to land once, closedBy=%d", f.closedBy)
+	}
+	if pr := f.pull(24); pr == nil || pr.State != "open" {
+		t.Fatalf("release PR #24 must be open, got %+v\nlog:\n%s", pr, l.text())
+	}
+}
