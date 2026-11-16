@@ -39,6 +39,8 @@ type API interface {
 	Pulls(ctx context.Context, state string) ([]forge.Pull, error)
 	LabeledPulls(ctx context.Context, state, label string) ([]forge.Pull, error)
 	GetPull(ctx context.Context, number int) (*forge.Pull, error)
+	BranchHead(ctx context.Context, name string) (string, error)
+	PullHeadRef(ctx context.Context, number int) (string, error)
 	CreatePull(ctx context.Context, head, base, title, body string) (*forge.Pull, error)
 	EditPull(ctx context.Context, number int, title, body string) error // refreshes AND reopens
 	EnsureLabel(ctx context.Context, name, color string) (int64, error)
@@ -314,6 +316,27 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 		return fmt.Errorf("creating release branch: %w", err)
 	}
 
+	// Reopen the PR we found BEFORE writing the release commit. Forgejo
+	// moves a PR's head ref (refs/pull/N/head) only on a push while the PR
+	// is open, and reopening does not move it: a commit written while the
+	// reset had the PR closed leaves the ref on the old commit, and the PR
+	// shows "broken due to missing fork information" (pupil #24). The branch
+	// equals base at this point; Forgejo reopens such a PR all the same.
+	if pr != nil {
+		opts.Logf("refreshing release PR #%d (was %s)", pr.Number, prState(pr))
+		if err := cl.EditPull(ctx, pr.Number, title, body); err != nil {
+			return err
+		}
+		// A PR that was already closed had no close to wait for above, so
+		// the delete's queued close can still land after the reopen; settle
+		// it before the commit, so the commit lands on an open PR.
+		if deleted[branch] && !awaited {
+			if err := keepOpen(ctx, cl, pr.Number, title, body, opts); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Every file's desired content derives from BASE, so re-running is
 	// idempotent. All changed files land in ONE commit (Gitea's multi-file
 	// contents API) titled with the release — not one commit per file, and
@@ -329,18 +352,9 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 		}
 	}
 
-	// Refresh the PR we found (reopening it if the branch reset closed it), or
-	// open one if there is none.
+	// The PR we found was reopened above; check it stayed open and that its
+	// head ref followed the commit. Otherwise open one.
 	if pr != nil {
-		opts.Logf("refreshing release PR #%d (was %s)", pr.Number, prState(pr))
-		if err := cl.EditPull(ctx, pr.Number, title, body); err != nil {
-			return err
-		}
-		// A PR that was already closed had no close to wait for above, so
-		// the delete's queued close can still land after the reopen.
-		if deleted[branch] && !awaited {
-			return keepOpen(ctx, cl, pr.Number, title, body, opts)
-		}
 		got, err := cl.GetPull(ctx, pr.Number)
 		if err != nil {
 			return err
@@ -348,7 +362,7 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 		if got.State != "open" {
 			return fmt.Errorf("release PR #%d is %s after the refresh, not open", pr.Number, prState(got))
 		}
-		return nil
+		return awaitHeadRef(ctx, cl, pr.Number, branch, opts)
 	}
 	created, err := cl.CreatePull(ctx, branch, opts.TargetBranch, title, body)
 	if err != nil {
@@ -684,6 +698,34 @@ func findReleasePR(ctx context.Context, cl API, branch string) (*forge.Pull, err
 		}
 	}
 	return closed, nil
+}
+
+// awaitHeadRef waits (up to CloseWait) for Forgejo to move the PR's head ref
+// to the branch head, which it does from a queue after the push. A ref that
+// stays behind fails the run: Forgejo shows that PR as broken.
+func awaitHeadRef(ctx context.Context, cl API, number int, branch string, opts Options) error {
+	deadline := time.Now().Add(opts.CloseWait)
+	for {
+		head, err := cl.BranchHead(ctx, branch)
+		if err != nil {
+			return err
+		}
+		ref, err := cl.PullHeadRef(ctx, number)
+		if err != nil {
+			return err
+		}
+		if ref == head {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("release PR #%d's head ref is at %s, its branch at %s: Forgejo shows it broken", number, short(ref), short(head))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(opts.PollEvery):
+		}
+	}
 }
 
 // awaitClosed waits until Forgejo has closed PR number after its head branch

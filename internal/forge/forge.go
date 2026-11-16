@@ -246,6 +246,49 @@ func (c *Client) ChangeFiles(ctx context.Context, branch, message string, files 
 
 // ---- branches -------------------------------------------------------------
 
+// BranchHead returns the commit a branch points at.
+func (c *Client) BranchHead(ctx context.Context, name string) (string, error) {
+	var b struct {
+		Commit struct {
+			ID string `json:"id"`
+		} `json:"commit"`
+	}
+	if err := c.do(ctx, "GET", c.urlf("/repos/%s/%s/branches/%s", c.owner, c.repo, name), nil, &b); err != nil {
+		return "", err
+	}
+	return b.Commit.ID, nil
+}
+
+// PullHeadRef returns the commit a PR's stored head ref (refs/pull/N/head)
+// points at. Forgejo answers a single ref or a list of matches.
+func (c *Client) PullHeadRef(ctx context.Context, number int) (string, error) {
+	var raw json.RawMessage
+	if err := c.do(ctx, "GET", c.urlf("/repos/%s/%s/git/refs/pull/%d/head", c.owner, c.repo, number), nil, &raw); err != nil {
+		return "", err
+	}
+	type ref struct {
+		Ref    string `json:"ref"`
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	var list []ref
+	if err := json.Unmarshal(raw, &list); err != nil {
+		var one ref
+		if err := json.Unmarshal(raw, &one); err != nil {
+			return "", err
+		}
+		list = []ref{one}
+	}
+	want := fmt.Sprintf("refs/pull/%d/head", number)
+	for _, r := range list {
+		if r.Ref == want {
+			return r.Object.SHA, nil
+		}
+	}
+	return "", fmt.Errorf("%s not found", want)
+}
+
 func (c *Client) BranchExists(ctx context.Context, name string) (bool, error) {
 	err := c.do(ctx, "GET", c.urlf("/repos/%s/%s/branches/%s", c.owner, c.repo, name), nil, nil)
 	if err == nil {
