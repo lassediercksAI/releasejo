@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -38,7 +39,7 @@ func New(apiBase, token, owner, repo string) *Client {
 		token: token,
 		owner: owner,
 		repo:  repo,
-		http:  &http.Client{Timeout: 30 * time.Second},
+		http:  &http.Client{Timeout: 90 * time.Second},
 	}
 }
 
@@ -295,6 +296,43 @@ func (c *Client) Pulls(ctx context.Context, state string) ([]Pull, error) {
 	q.Set("limit", "50")
 	err := c.do(ctx, "GET", c.urlf("/repos/%s/%s/pulls?%s", c.owner, c.repo, q.Encode()), nil, &out)
 	return out, err
+}
+
+// LabeledPulls returns the PRs in the given state ("open","closed","all")
+// that carry the label, each fetched on its own.
+//
+// It avoids the pulls listing, which makes Forgejo compute a diff for every
+// PR it returns. Release PRs reuse one head branch, so each old one is diffed
+// from its old merge base to the branch's current head: on pupil the listing
+// took 20-26 s at 24 PRs, growing by one PR per release, until it passed the
+// client timeout. The issues listing filtered by label is cheap, and only the
+// few PRs still carrying the label are fetched in full.
+func (c *Client) LabeledPulls(ctx context.Context, state, label string) ([]Pull, error) {
+	var out []Pull
+	for page := 1; ; page++ {
+		q := url.Values{}
+		q.Set("type", "pulls")
+		q.Set("state", state)
+		q.Set("labels", label)
+		q.Set("limit", "50")
+		q.Set("page", strconv.Itoa(page))
+		var issues []struct {
+			Number int `json:"number"`
+		}
+		if err := c.do(ctx, "GET", c.urlf("/repos/%s/%s/issues?%s", c.owner, c.repo, q.Encode()), nil, &issues); err != nil {
+			return nil, err
+		}
+		for _, is := range issues {
+			p, err := c.GetPull(ctx, is.Number)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, *p)
+		}
+		if len(issues) < 50 {
+			return out, nil
+		}
+	}
 }
 
 // GetPull returns one PR.
