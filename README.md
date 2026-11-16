@@ -135,7 +135,8 @@ is deleted. A commit footer needs no cleanup.
 On every push to the target branch, `releasejo`:
 
 1. **Tags merged releases.** If a release PR was just merged, it cuts the tag +
-   Release for each package whose manifest version isn't tagged yet.
+   Release for each package whose manifest version isn't tagged yet, then
+   deletes the merged PR's head branch.
 2. **(Re)builds the release PR.** It collects commits since each package's last
    release tag, computes the next semver (conventional-commit driven, with
    `bump-minor-pre-major` support and any [Release-As](#release-as) override),
@@ -147,6 +148,12 @@ re-running never stacks duplicate changelog entries. Rebuilding deletes and
 recreates the head branch — which makes Forgejo close the PR — so a refresh
 reopens and reuses the same release PR instead of opening a new one: the release
 PR keeps one number for the whole cycle.
+
+Forgejo closes those PRs from a queue and matches them by branch name when the
+close lands, so the close can also take a PR opened on the recreated branch
+after the delete. That is why the merged PR's branch is deleted when its
+release is cut, and why a PR opened on a branch deleted in the same run is
+watched for a short while and reopened if the close takes it.
 
 ## Status & scope (v0.x)
 
