@@ -46,6 +46,11 @@ type fakeForge struct {
 	queuedBranchClose int
 	pendingBranch     map[string]int // branch -> GetPull calls left before its close lands
 	labelSet          map[int][]int64
+	// heads and prRefs model commits: a branch's head, and each PR's stored
+	// head ref, which (as in Forgejo) moves only on a push while the PR is
+	// open and is set when the PR is created.
+	heads  map[string]string
+	prRefs map[int]string
 }
 
 // pull returns the PR with that number, or nil.
@@ -63,6 +68,7 @@ func newFake() *fakeForge {
 		tags: map[string]string{}, commits: map[string][]forge.Commit{}, commitsAt: map[string][]forge.Commit{},
 		files: map[string]*forge.File{}, branches: map[string]bool{},
 		puts: map[string]string{}, labelSet: map[int][]int64{},
+		heads: map[string]string{}, prRefs: map[int]string{},
 	}
 }
 
@@ -83,9 +89,19 @@ func (f *fakeForge) Commits(_ context.Context, ref, path string, _ int) ([]forge
 func (f *fakeForge) BranchExists(_ context.Context, name string) (bool, error) {
 	return f.branches[name], nil
 }
-func (f *fakeForge) CreateBranch(_ context.Context, name, _ string) error {
+func (f *fakeForge) CreateBranch(_ context.Context, name, from string) error {
 	f.branches[name] = true
+	f.heads[name] = "base-of-" + from
 	return nil
+}
+func (f *fakeForge) BranchHead(_ context.Context, name string) (string, error) {
+	if !f.branches[name] {
+		return "", notFound()
+	}
+	return f.heads[name], nil
+}
+func (f *fakeForge) PullHeadRef(_ context.Context, number int) (string, error) {
+	return f.prRefs[number], nil
 }
 
 // DeleteBranch removes a branch. Forgejo CLOSES any open PR whose head branch is
@@ -94,6 +110,12 @@ func (f *fakeForge) CreateBranch(_ context.Context, name, _ string) error {
 func (f *fakeForge) DeleteBranch(_ context.Context, name string) error {
 	f.branches[name] = false
 	f.deletes++
+	// The branch's files go with it; a recreated branch reads base's.
+	for k := range f.files {
+		if strings.HasPrefix(k, name+"\x00") {
+			delete(f.files, k)
+		}
+	}
 	if f.queuedBranchClose > 0 {
 		if f.pendingBranch == nil {
 			f.pendingBranch = map[string]int{}
@@ -186,6 +208,12 @@ func (f *fakeForge) GetFile(_ context.Context, path, ref string) (*forge.File, e
 // one commit, mirroring the real client.
 func (f *fakeForge) ChangeFiles(_ context.Context, branch, _ string, files []forge.FileChange) error {
 	f.commitCount++
+	f.heads[branch] = fmt.Sprintf("commit-%d", f.commitCount)
+	for i := range f.pulls {
+		if f.pulls[i].Head.Ref == branch && f.pulls[i].State == "open" && !f.pulls[i].Merged {
+			f.prRefs[f.pulls[i].Number] = f.heads[branch]
+		}
+	}
 	for _, fc := range files {
 		key := branch + "\x00" + fc.Path
 		if fc.Op == "delete" {
@@ -221,6 +249,7 @@ func (f *fakeForge) CreatePull(_ context.Context, head, base, title, body string
 	p := forge.Pull{Number: 100 + len(f.created), Title: title, Body: body, State: "open"}
 	p.Head.Ref = head
 	f.created = append(f.created, p)
+	f.prRefs[p.Number] = f.heads[head]
 	f.pulls = append(f.pulls, p) // a later run must see it, like the real API
 	return &p, nil
 }
@@ -1169,5 +1198,35 @@ func TestRefreshOfClosedPRSurvivesQueuedClose(t *testing.T) {
 	}
 	if pr := f.pull(24); pr == nil || pr.State != "open" {
 		t.Fatalf("release PR #24 must be open, got %+v\nlog:\n%s", pr, l.text())
+	}
+}
+
+// pupil #24: the refresh found the release PR closed, reset the branch and
+// wrote the release commit while the PR was closed, then reopened it. Forgejo
+// had not moved the PR's head ref (it moves only on a push to an open PR), so
+// the PR showed "broken due to missing fork information". The PR is reopened
+// before the commit, so its ref follows the branch.
+func TestRefreshKeepsThePRHeadRefOnTheBranch(t *testing.T) {
+	for _, state := range []string{"closed", "open"} {
+		t.Run(state, func(t *testing.T) {
+			f := newFake()
+			f.commits["."] = []forge.Commit{{SHA: "c2", Message: "feat: worksheets"}}
+			f.tags["v0.18.0"] = "m23"
+			f.branches[releaseBranch] = true
+			f.heads[releaseBranch] = "old"
+			f.pulls = []forge.Pull{pendingPull(24, state, forge.Label{ID: 7, Name: pendingLabel})}
+			f.prRefs[24] = "old"
+			opts := Options{TargetBranch: "main", Now: fixedClock(), PollEvery: time.Millisecond,
+				CloseWait: 20 * time.Millisecond, SettleWait: 5 * time.Millisecond}
+			if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.18.0"}, opts); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := f.prRefs[24], f.heads[releaseBranch]; got != want {
+				t.Fatalf("PR #24 head ref = %q, branch head = %q", got, want)
+			}
+			if pr := f.pull(24); pr.State != "open" {
+				t.Fatalf("PR #24 must be open, got %s", pr.State)
+			}
+		})
 	}
 }
