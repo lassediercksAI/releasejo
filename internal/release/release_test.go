@@ -207,6 +207,16 @@ func (f *fakeForge) Pulls(_ context.Context, state string) ([]forge.Pull, error)
 	}
 	return out, nil
 }
+func (f *fakeForge) LabeledPulls(ctx context.Context, state, label string) ([]forge.Pull, error) {
+	ps, _ := f.Pulls(ctx, state)
+	var out []forge.Pull
+	for _, p := range ps {
+		if hasLabel(p, label) {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
 func (f *fakeForge) CreatePull(_ context.Context, head, base, title, body string) (*forge.Pull, error) {
 	p := forge.Pull{Number: 100 + len(f.created), Title: title, Body: body, State: "open"}
 	p.Head.Ref = head

@@ -37,6 +37,7 @@ type API interface {
 	GetFile(ctx context.Context, path, ref string) (*forge.File, error)
 	ChangeFiles(ctx context.Context, branch, message string, files []forge.FileChange) error
 	Pulls(ctx context.Context, state string) ([]forge.Pull, error)
+	LabeledPulls(ctx context.Context, state, label string) ([]forge.Pull, error)
 	GetPull(ctx context.Context, number int) (*forge.Pull, error)
 	CreatePull(ctx context.Context, head, base, title, body string) (*forge.Pull, error)
 	EditPull(ctx context.Context, number int, title, body string) error // refreshes AND reopens
@@ -420,7 +421,7 @@ type cutRelease struct {
 // It returns, per package path, the newest version those merges released.
 func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, deleted map[string]bool, opts Options) (map[string]cutRelease, error) {
 	cut := map[string]cutRelease{}
-	closed, err := cl.Pulls(ctx, "closed")
+	closed, err := cl.LabeledPulls(ctx, "closed", pendingLabel)
 	if err != nil {
 		return nil, err
 	}
@@ -656,10 +657,17 @@ func readFileOr(ctx context.Context, cl API, path, ref string) (string, error) {
 // its tags is tagMerged's business. The pending label is required so an
 // unrelated closed PR on the same branch name is left alone.
 func findReleasePR(ctx context.Context, cl API, branch string) (*forge.Pull, error) {
-	all, err := cl.Pulls(ctx, "all")
+	// Open PRs are cheap to list; closed ones only by label (see
+	// forge.LabeledPulls), and only a closed PR with the label is a candidate.
+	open, err := cl.Pulls(ctx, "open")
 	if err != nil {
 		return nil, err
 	}
+	closedPending, err := cl.LabeledPulls(ctx, "closed", pendingLabel)
+	if err != nil {
+		return nil, err
+	}
+	all := append(open, closedPending...)
 	var closed *forge.Pull
 	for i := range all {
 		p := &all[i]
