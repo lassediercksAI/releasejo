@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.17](https://github.com/lassediercksAI/releasejo/compare/v0.0.16...v0.0.17) (2026-11-16)
+
+
+### Bug Fixes
+
+* **release:** reopen the release PR before writing the release commit ([#28](https://github.com/lassediercksAI/releasejo/issues/28)) ([c59e57d](https://github.com/lassediercksAI/releasejo/commit/c59e57d6a27d56522f3a5fbc4dffd4f65815f097))
+
 ## [0.0.16](https://github.com/lassediercksAI/releasejo/compare/v0.0.15...v0.0.16) (2026-11-16)
 
 
