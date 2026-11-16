@@ -57,6 +57,9 @@ type Options struct {
 	// (default 1s).
 	CloseWait time.Duration
 	PollEvery time.Duration
+	// SettleWait bounds how long a release PR opened on a branch this run
+	// deleted is watched for Forgejo's queued close (default 15s).
+	SettleWait time.Duration
 }
 
 func (o *Options) defaults() {
@@ -75,7 +78,13 @@ func (o *Options) defaults() {
 	if o.PollEvery == 0 {
 		o.PollEvery = time.Second
 	}
+	if o.SettleWait == 0 {
+		o.SettleWait = defaultSettleWait
+	}
 }
+
+// defaultSettleWait is SettleWait's default (a var so tests can shorten it).
+var defaultSettleWait = 15 * time.Second
 
 // pkgPlan is a pending release for one package.
 type pkgPlan struct {
@@ -92,7 +101,12 @@ type pkgPlan struct {
 func Run(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) error {
 	opts.defaults()
 
-	cut, err := tagMerged(ctx, cl, cfg, man, opts)
+	// Branches this run deleted. Forgejo closes the PRs of a deleted branch
+	// from a queue, matching them by branch name when the close lands, so a
+	// PR opened on a recreated branch of the same name can be closed by it.
+	deleted := map[string]bool{}
+
+	cut, err := tagMerged(ctx, cl, cfg, man, deleted, opts)
 	if err != nil {
 		return fmt.Errorf("tagging merged release: %w", err)
 	}
@@ -115,7 +129,7 @@ func Run(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, o
 		opts.Logf("no releasable changes since the last release")
 		return nil
 	}
-	return upsertReleasePRs(ctx, cl, cfg, man, plans, opts)
+	return upsertReleasePRs(ctx, cl, cfg, man, plans, deleted, opts)
 }
 
 // TagFor builds the git tag for a package version, honouring include-v-in-tag
@@ -222,22 +236,22 @@ func computePlans(ctx context.Context, cl API, cfg *config.Config, man config.Ma
 // is rebuilt from base, so after one component PR merges the others are re-derived
 // from the new base on the next run — sequential merges reconcile the shared
 // manifest cleanly.
-func upsertReleasePRs(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, plans []pkgPlan, opts Options) error {
+func upsertReleasePRs(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, plans []pkgPlan, deleted map[string]bool, opts Options) error {
 	if cfg.SeparatePullRequests {
 		for _, pl := range plans {
 			branch := "releasejo--branches--" + opts.TargetBranch + "--components--" + componentSlug(pl.pkg)
-			if err := buildAndUpsertPR(ctx, cl, man, []pkgPlan{pl}, branch, opts); err != nil {
+			if err := buildAndUpsertPR(ctx, cl, man, []pkgPlan{pl}, branch, deleted, opts); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	return buildAndUpsertPR(ctx, cl, man, plans, "releasejo--branches--"+opts.TargetBranch, opts)
+	return buildAndUpsertPR(ctx, cl, man, plans, "releasejo--branches--"+opts.TargetBranch, deleted, opts)
 }
 
 // buildAndUpsertPR rebuilds `branch` from base with the given plans' changes and
 // opens or refreshes its PR.
-func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []pkgPlan, branch string, opts Options) error {
+func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []pkgPlan, branch string, deleted map[string]bool, opts Options) error {
 	title := releaseTitle(plans)
 	body := releaseBody(plans)
 
@@ -282,6 +296,7 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 		if err := cl.DeleteBranch(ctx, branch); err != nil {
 			return fmt.Errorf("resetting release branch to base: %w", err)
 		}
+		deleted[branch] = true
 		// Forgejo closes the PR from a queue, so the close can land after
 		// the refresh below has "reopened" a PR that was still open, which
 		// leaves it closed with no release PR at all (website #161, ogof
@@ -336,7 +351,53 @@ func buildAndUpsertPR(ctx context.Context, cl API, man config.Manifest, plans []
 	if err != nil {
 		return err
 	}
-	return cl.SetIssueLabels(ctx, created.Number, []int64{id})
+	if err := cl.SetIssueLabels(ctx, created.Number, []int64{id}); err != nil {
+		return err
+	}
+	// The branch was deleted this run (a merged PR's leftover, or the reset
+	// above), so Forgejo's queued close for it may still be pending. It
+	// closes PRs by branch name when it lands and takes the PR just opened
+	// (pupil #6, #18, #24: opened and closed in the same second, run green).
+	if deleted[branch] {
+		return keepOpen(ctx, cl, created.Number, title, body, opts)
+	}
+	return nil
+}
+
+// keepOpen watches a release PR opened on a branch deleted earlier in the run
+// for up to SettleWait. If Forgejo's queued close takes it, it is reopened; the
+// queue closes once per delete, so one reopen settles it. A PR that is not open
+// at the end fails the run, so a green run always leaves an open release PR.
+func keepOpen(ctx context.Context, cl API, number int, title, body string, opts Options) error {
+	deadline := time.Now().Add(opts.SettleWait)
+	for {
+		p, err := cl.GetPull(ctx, number)
+		if err != nil {
+			return err
+		}
+		if p.State != "open" {
+			opts.Logf("release PR #%d was closed by the queued branch delete; reopening", number)
+			if err := cl.EditPull(ctx, number, title, body); err != nil {
+				return err
+			}
+			got, err := cl.GetPull(ctx, number)
+			if err != nil {
+				return err
+			}
+			if got.State != "open" {
+				return fmt.Errorf("release PR #%d is %s after reopening, not open", number, prState(got))
+			}
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(opts.PollEvery):
+		}
+	}
 }
 
 // cutRelease is a version a merged release PR released, and the commit its
@@ -350,7 +411,7 @@ type cutRelease struct {
 // tagMerged looks for a just-merged release PR and cuts the tags/releases its
 // merge introduced (versions now present in main's manifest but not yet tagged).
 // It returns, per package path, the newest version those merges released.
-func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, opts Options) (map[string]cutRelease, error) {
+func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manifest, deleted map[string]bool, opts Options) (map[string]cutRelease, error) {
 	cut := map[string]cutRelease{}
 	closed, err := cl.Pulls(ctx, "closed")
 	if err != nil {
@@ -418,9 +479,44 @@ func tagMerged(ctx context.Context, cl API, cfg *config.Config, man config.Manif
 			if err := cl.SetIssueLabels(ctx, pr.Number, []int64{id}); err != nil {
 				return nil, err
 			}
+			if err := deleteMergedBranch(ctx, cl, pr, deleted, opts); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return cut, nil
+}
+
+// deleteMergedBranch deletes a merged release PR's head branch once its
+// release is cut. Left behind, the next release run deletes it to reset the
+// branch, and Forgejo's queued close for that delete can take the release PR
+// that run just opened. Deleted now, the close is queued while no PR is open
+// on the branch, and the next run finds no branch to delete. The branch is
+// kept when an open PR already uses it again.
+func deleteMergedBranch(ctx context.Context, cl API, pr forge.Pull, deleted map[string]bool, opts Options) error {
+	branch := pr.Head.Ref
+	if !strings.HasPrefix(branch, "releasejo--branches--") {
+		return nil
+	}
+	exists, err := cl.BranchExists(ctx, branch)
+	if err != nil || !exists {
+		return err
+	}
+	open, err := cl.Pulls(ctx, "open")
+	if err != nil {
+		return err
+	}
+	for _, p := range open {
+		if p.Head.Ref == branch {
+			return nil
+		}
+	}
+	if err := cl.DeleteBranch(ctx, branch); err != nil {
+		return fmt.Errorf("deleting merged release branch %s: %w", branch, err)
+	}
+	deleted[branch] = true
+	opts.Logf("deleted merged release branch %s (PR #%d)", branch, pr.Number)
+	return nil
 }
 
 // liveManifest returns the manifest on the target branch now, falling back to

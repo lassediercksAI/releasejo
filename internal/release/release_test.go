@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +39,13 @@ type fakeForge struct {
 	// of that PR, or at flush.
 	queuedClose int
 	pending     map[int]int // PR number -> GetPull calls left before it closes
-	labelSet    map[int][]int64
+	// queuedBranchClose models the queued close as Forgejo runs it: keyed
+	// by branch name and applied to whatever PR is open on that branch when
+	// it lands (on the queuedBranchClose-th GetPull, or at flush), which can
+	// be a PR opened after the delete.
+	queuedBranchClose int
+	pendingBranch     map[string]int // branch -> GetPull calls left before its close lands
+	labelSet          map[int][]int64
 }
 
 // pull returns the PR with that number, or nil.
@@ -87,6 +94,13 @@ func (f *fakeForge) CreateBranch(_ context.Context, name, _ string) error {
 func (f *fakeForge) DeleteBranch(_ context.Context, name string) error {
 	f.branches[name] = false
 	f.deletes++
+	if f.queuedBranchClose > 0 {
+		if f.pendingBranch == nil {
+			f.pendingBranch = map[string]int{}
+		}
+		f.pendingBranch[name] = f.queuedBranchClose
+		return nil
+	}
 	for i := range f.pulls {
 		if f.pulls[i].Head.Ref == name && f.pulls[i].State == "open" && !f.pulls[i].Merged {
 			if f.queuedClose > 0 {
@@ -108,6 +122,13 @@ func (f *fakeForge) GetPull(_ context.Context, number int) (*forge.Pull, error) 
 	if p == nil {
 		return nil, notFound()
 	}
+	for branch, left := range f.pendingBranch {
+		if left <= 1 {
+			f.closeBranch(branch)
+		} else {
+			f.pendingBranch[branch] = left - 1
+		}
+	}
 	if left, ok := f.pending[number]; ok {
 		if left <= 1 {
 			f.closeQueued(number)
@@ -127,11 +148,31 @@ func (f *fakeForge) closeQueued(number int) {
 	}
 }
 
+// closeBranch lands a branch-keyed queued close: every open, unmerged PR on
+// the branch NOW is closed.
+func (f *fakeForge) closeBranch(branch string) {
+	delete(f.pendingBranch, branch)
+	for i := range f.pulls {
+		if f.pulls[i].Head.Ref == branch && f.pulls[i].State == "open" && !f.pulls[i].Merged {
+			f.pulls[i].State = "closed"
+			f.closedBy++
+		}
+	}
+}
+
 // flush lands every close still in the queue, as Forgejo does after the run.
 func (f *fakeForge) flush() {
 	for n := range f.pending {
 		f.closeQueued(n)
 	}
+	for b := range f.pendingBranch {
+		f.closeBranch(b)
+	}
+}
+
+func TestMain(m *testing.M) {
+	defaultSettleWait = 5 * time.Millisecond
+	os.Exit(m.Run())
 }
 func (f *fakeForge) GetFile(_ context.Context, path, ref string) (*forge.File, error) {
 	if file, ok := f.files[ref+"\x00"+path]; ok {
@@ -1000,5 +1041,94 @@ func TestRefreshDoesNotWaitForeverForTheClose(t *testing.T) {
 	}
 	if pr := f.pull(93); pr == nil || pr.State != "open" {
 		t.Fatalf("PR #93 must be open, got %+v", pr)
+	}
+}
+
+// mergedPull is a merged release PR on releaseBranch that is still to be tagged.
+func mergedPull(number int, sha string) forge.Pull {
+	p := forge.Pull{Number: number, State: "closed", Merged: true, MergeCommitSHA: sha,
+		Labels: []forge.Label{{ID: 7, Name: pendingLabel}}}
+	p.Head.Ref = releaseBranch
+	return p
+}
+
+// pupil #24: the previous release PR was merged and tagged, its branch left
+// behind. The next run deletes it to reset it, opens a new PR on the recreated
+// branch, and Forgejo's queued close for the delete lands after that and takes
+// the new PR. The run must reopen it and leave it open.
+func TestNewPRSurvivesQueuedCloseOfLeftoverBranch(t *testing.T) {
+	f := newFake()
+	f.queuedBranchClose = 2
+	f.commits["."] = []forge.Commit{{SHA: "c2", Message: "feat: in a topic, how close the exam is"}}
+	f.tags["v0.18.0"] = "m23"
+	f.branches[releaseBranch] = true // left behind by merged #23
+	tagged := mergedPull(23, "m23")
+	tagged.Labels = []forge.Label{{ID: 8, Name: taggedLabel}}
+	f.pulls = []forge.Pull{tagged}
+	l := &logSink{}
+	opts := Options{TargetBranch: "main", Now: fixedClock(), Logf: l.logf, PollEvery: time.Millisecond, SettleWait: time.Second}
+	if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.18.0"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	f.flush()
+
+	if len(f.created) != 1 {
+		t.Fatalf("expected 1 new release PR, got %d", len(f.created))
+	}
+	n := f.created[0].Number
+	if f.closedBy != 1 {
+		t.Fatalf("expected the queued close to land once, closedBy=%d", f.closedBy)
+	}
+	if pr := f.pull(n); pr == nil || pr.State != "open" {
+		t.Fatalf("new release PR #%d must be open, got %+v\nlog:\n%s", n, pr, l.text())
+	}
+	if !strings.Contains(l.text(), "reopening") {
+		t.Errorf("expected the reopen to be logged:\n%s", l.text())
+	}
+}
+
+// Tagging a merged release PR deletes its branch, so the next release run has
+// no branch to delete and no queued close can take its new PR.
+func TestTagOnMergeDeletesTheMergedBranch(t *testing.T) {
+	f := newFake()
+	f.branches[releaseBranch] = true
+	f.pulls = []forge.Pull{mergedPull(23, "m23")}
+	opts := Options{TargetBranch: "main", Now: fixedClock()}
+	if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.18.0"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.releases) != 1 || f.releases[0] != "v0.18.0" {
+		t.Fatalf("expected release v0.18.0, got %v", f.releases)
+	}
+	if f.branches[releaseBranch] || f.deletes != 1 {
+		t.Fatalf("merged release branch must be deleted once, exists=%v deletes=%d", f.branches[releaseBranch], f.deletes)
+	}
+
+	// The next run, with something new to release, opens a PR without a delete.
+	f.tags["v0.18.0"] = "m23"
+	f.pulls[0].Labels = []forge.Label{{ID: 8, Name: taggedLabel}}
+	f.commits["."] = []forge.Commit{{SHA: "c2", Message: "fix: a thing"}}
+	if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.18.0"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	if f.deletes != 1 {
+		t.Errorf("next run must not delete the branch again, deletes=%d", f.deletes)
+	}
+	if len(f.created) != 1 {
+		t.Errorf("expected 1 release PR, got %d", len(f.created))
+	}
+}
+
+// The merged branch stays when an open PR already uses it again.
+func TestTagOnMergeKeepsABranchAnOpenPRUses(t *testing.T) {
+	f := newFake()
+	f.branches[releaseBranch] = true
+	f.pulls = []forge.Pull{mergedPull(23, "m23"), pendingPull(24, "open", forge.Label{ID: 7, Name: pendingLabel})}
+	opts := Options{TargetBranch: "main", Now: fixedClock()}
+	if err := Run(context.Background(), f, goConfig(), config.Manifest{".": "0.18.0"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	if !f.branches[releaseBranch] || f.deletes != 0 {
+		t.Fatalf("branch of open PR #24 must be kept, exists=%v deletes=%d", f.branches[releaseBranch], f.deletes)
 	}
 }
