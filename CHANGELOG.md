@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.14](https://github.com/lassediercksAI/releasejo/compare/v0.0.13...v0.0.14) (2026-11-16)
+
+
+### Bug Fixes
+
+* **release:** keep a new release PR open when Forgejo's queued branch close lands after it ([#22](https://github.com/lassediercksAI/releasejo/issues/22)) ([d3c9bfd](https://github.com/lassediercksAI/releasejo/commit/d3c9bfd81488cca8517e3b3c482ad3275ba42114))
+
 ## [0.0.13](https://github.com/lassediercksAI/releasejo/compare/v0.0.12...v0.0.13) (2026-10-25)
 
 
