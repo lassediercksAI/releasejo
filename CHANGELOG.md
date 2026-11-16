@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.16](https://github.com/lassediercksAI/releasejo/compare/v0.0.15...v0.0.16) (2026-11-16)
+
+
+### Bug Fixes
+
+* **forge:** find release PRs through the label-filtered issues listing ([#26](https://github.com/lassediercksAI/releasejo/issues/26)) ([5224e11](https://github.com/lassediercksAI/releasejo/commit/5224e116aa6fd9ec5abfa38feb62d2b948dfc64a))
+
 ## [0.0.15](https://github.com/lassediercksAI/releasejo/compare/v0.0.14...v0.0.15) (2026-11-16)
 
 
